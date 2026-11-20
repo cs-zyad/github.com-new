@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { prisma } from "@/lib/db";
+import { adminSupportTickets } from "@/services/queries";
 import { formatDateTime } from "@/lib/format";
 import { supportCategoryLabel, supportStatusLabel } from "@/lib/labels";
 import { PageHeader, Badge, Empty } from "@/components/ui";
@@ -9,12 +9,7 @@ export const metadata = { title: "الشكاوى والدعم" };
 export default async function AdminSupport({ searchParams }: { searchParams: Promise<Record<string, string>> }) {
   const sp = await searchParams;
   const status = sp.status ?? "open";
-  const tickets = await prisma.supportTicket.findMany({
-    where: status === "open" ? { status: { in: ["OPEN", "IN_PROGRESS"] } } : {},
-    orderBy: { updatedAt: "desc" },
-    include: { owner: { select: { name: true } } },
-    take: 200,
-  });
+  const tickets = await adminSupportTickets(status === "open");
   return (
     <div className="stack">
       <PageHeader title="الشكاوى وطلبات الدعم" />

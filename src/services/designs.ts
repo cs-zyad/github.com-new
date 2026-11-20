@@ -1,7 +1,8 @@
 import { z } from "zod";
-import { prisma, withTx } from "@/lib/db";
+import { C, col, ref, getDoc, getDocs, newId, runTx, txGet, type Transaction } from "@/lib/firestore";
 import { AppError, NotFoundError } from "@/lib/errors";
-import { audit } from "@/lib/audit";
+import { audit, auditTx } from "@/lib/audit";
+import type { DesignRequest, Event, Template, User } from "@/lib/types";
 import { parseMoney } from "@/lib/format";
 import { TEMPLATE_LAYOUTS } from "@/lib/constants";
 
@@ -27,20 +28,68 @@ export async function createDesignRequest(ownerId: string, input: z.input<typeof
   const r = requestSchema.safeParse(input);
   if (!r.success) throw new AppError(r.error.issues[0]?.message ?? "بيانات غير صالحة");
   if (r.data.eventId) {
-    const ev = await prisma.event.findFirst({ where: { id: r.data.eventId, ownerId } });
-    if (!ev) throw new NotFoundError("الفعالية غير موجودة");
+    const ev = await getDoc<Event>(C.events, r.data.eventId);
+    if (!ev || ev.ownerId !== ownerId) throw new NotFoundError("الفعالية غير موجودة");
   }
-  const req = await prisma.designRequest.create({ data: { ...r.data, ownerId } });
-  await audit(prisma, { actorId: ownerId, action: "design.request", entityType: "DesignRequest", entityId: req.id });
+  const now = new Date();
+  const req: DesignRequest = {
+    id: newId(),
+    ownerId,
+    eventId: r.data.eventId,
+    title: r.data.title,
+    details: r.data.details,
+    referenceUrl: r.data.referenceUrl,
+    status: "SUBMITTED",
+    quoteAmount: null,
+    quoteNotes: null,
+    quoteValidUntil: null,
+    quotedAt: null,
+    acceptedAt: null,
+    deliveredTemplateId: null,
+    createdAt: now,
+    updatedAt: now,
+  };
+  const { id, ...data } = req;
+  await ref(C.designRequests, id).set(data);
+  await audit({ actorId: ownerId, action: "design.request", entityType: "DesignRequest", entityId: req.id });
+  return req;
+}
+
+/** تعليق في سلسلة مراسلات (طلب تصميم أو دعم) — اسم الكاتب ودوره يُحفظان معه */
+export async function addComment(authorId: string, target: { designRequestId?: string; supportTicketId?: string }, body: string) {
+  const author = await getDoc<User>(C.users, authorId);
+  await ref(C.comments, newId()).set({
+    authorId,
+    authorName: author?.name ?? "",
+    authorRole: author?.role ?? "USER",
+    designRequestId: target.designRequestId ?? null,
+    supportTicketId: target.supportTicketId ?? null,
+    body,
+    createdAt: new Date(),
+  });
+}
+
+export async function listComments(target: { designRequestId?: string; supportTicketId?: string }) {
+  const q = target.designRequestId
+    ? col(C.comments).where("designRequestId", "==", target.designRequestId)
+    : col(C.comments).where("supportTicketId", "==", target.supportTicketId!);
+  const rows = await getDocs<import("@/lib/types").Comment>(q);
+  return rows
+    .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
+    .map((c) => ({ ...c, author: { id: c.authorId, name: c.authorName, role: c.authorRole } }));
+}
+
+async function getRequest(requestId: string, ownerId?: string) {
+  const req = await getDoc<DesignRequest>(C.designRequests, requestId);
+  if (!req || (ownerId && req.ownerId !== ownerId)) throw new NotFoundError("الطلب غير موجود");
   return req;
 }
 
 export async function addDesignComment(userId: string, requestId: string, body: string, asAdmin: boolean) {
   const text = body.trim();
   if (text.length < 1 || text.length > 4000) throw new AppError("اكتب رسالة");
-  const req = await prisma.designRequest.findFirst({ where: asAdmin ? { id: requestId } : { id: requestId, ownerId: userId } });
-  if (!req) throw new NotFoundError("الطلب غير موجود");
-  return prisma.comment.create({ data: { authorId: userId, designRequestId: req.id, body: text } });
+  const req = await getRequest(requestId, asAdmin ? undefined : userId);
+  await addComment(userId, { designRequestId: req.id }, text);
 }
 
 /** الأدمن يرسل عرض سعر */
@@ -52,60 +101,62 @@ export async function quoteDesignRequest(
   const amount = parseMoney(input.amount);
   if (!amount || amount < 100) throw new AppError("أدخل مبلغًا صحيحًا");
   const days = Math.max(1, Math.min(90, Number(input.validDays) || 14));
-  const req = await prisma.designRequest.findUnique({ where: { id: requestId } });
-  if (!req) throw new NotFoundError("الطلب غير موجود");
+  const req = await getRequest(requestId);
   if (!["SUBMITTED", "QUOTED"].includes(req.status)) throw new AppError("لا يمكن تعديل العرض في هذه المرحلة");
-  const updated = await prisma.designRequest.update({
-    where: { id: req.id },
-    data: {
-      status: "QUOTED",
-      quoteAmount: amount,
-      quoteNotes: input.notes.trim().slice(0, 2000) || null,
-      quotedAt: new Date(),
-      quoteValidUntil: new Date(Date.now() + days * 86400000),
-    },
-  });
-  await audit(prisma, { actorId: adminId, action: "design.quote", entityType: "DesignRequest", entityId: req.id, meta: { amount } });
-  return updated;
+  const patch = {
+    status: "QUOTED",
+    quoteAmount: amount,
+    quoteNotes: input.notes.trim().slice(0, 2000) || null,
+    quotedAt: new Date(),
+    quoteValidUntil: new Date(Date.now() + days * 86400000),
+    updatedAt: new Date(),
+  };
+  await ref(C.designRequests, req.id).update(patch);
+  await audit({ actorId: adminId, action: "design.quote", entityType: "DesignRequest", entityId: req.id, meta: { amount } });
+  return { ...req, ...patch };
 }
 
 export async function rejectDesignRequest(adminId: string, requestId: string, reason: string) {
-  const req = await prisma.designRequest.findUnique({ where: { id: requestId } });
-  if (!req) throw new NotFoundError("الطلب غير موجود");
+  const req = await getRequest(requestId);
   if (!["SUBMITTED", "QUOTED"].includes(req.status)) throw new AppError("لا يمكن رفض الطلب في هذه المرحلة");
-  await withTx(async (tx) => {
-    await tx.designRequest.update({ where: { id: req.id }, data: { status: "REJECTED" } });
-    if (reason.trim()) await tx.comment.create({ data: { authorId: adminId, designRequestId: req.id, body: reason.trim() } });
-    await audit(tx, { actorId: adminId, action: "design.reject", entityType: "DesignRequest", entityId: req.id });
-  });
+  await ref(C.designRequests, req.id).update({ status: "REJECTED", updatedAt: new Date() });
+  if (reason.trim()) await addComment(adminId, { designRequestId: req.id }, reason.trim());
+  await audit({ actorId: adminId, action: "design.reject", entityType: "DesignRequest", entityId: req.id });
 }
 
 /** المنظّم يقبل العرض (ثم يدفع) */
 export async function acceptDesignQuote(ownerId: string, requestId: string) {
-  const req = await prisma.designRequest.findFirst({ where: { id: requestId, ownerId } });
-  if (!req) throw new NotFoundError("الطلب غير موجود");
-  if (req.status !== "QUOTED") throw new AppError("لا يوجد عرض سعر بانتظار القبول");
-  if (req.quoteValidUntil && req.quoteValidUntil < new Date()) throw new AppError("انتهت صلاحية العرض. اطلب تحديثه من فريق المنصة.");
-  const res = await prisma.designRequest.updateMany({
-    where: { id: req.id, status: "QUOTED" },
-    data: { status: "ACCEPTED", acceptedAt: new Date() },
+  await transition(requestId, ownerId, (req) => {
+    if (req.status !== "QUOTED") throw new AppError("لا يوجد عرض سعر بانتظار القبول");
+    if (req.quoteValidUntil && req.quoteValidUntil < new Date()) throw new AppError("انتهت صلاحية العرض. اطلب تحديثه من فريق المنصة.");
+    return { status: "ACCEPTED", acceptedAt: new Date() };
   });
-  if (res.count !== 1) throw new AppError("تغيّرت حالة الطلب. حدّث الصفحة.");
-  await audit(prisma, { actorId: ownerId, action: "design.accept", entityType: "DesignRequest", entityId: req.id });
+  await audit({ actorId: ownerId, action: "design.accept", entityType: "DesignRequest", entityId: requestId });
+}
+
+/** انتقال حالة الطلب بمعاملة (يمنع تعارض تعديلين متزامنين) */
+async function transition(requestId: string, ownerId: string | undefined, fn: (req: DesignRequest) => Record<string, unknown>, tail?: (tx: Transaction) => void) {
+  await runTx(async (tx) => {
+    const req = await txGet<DesignRequest>(tx, ref(C.designRequests, requestId));
+    if (!req || (ownerId && req.ownerId !== ownerId)) throw new NotFoundError("الطلب غير موجود");
+    tx.update(ref(C.designRequests, requestId), { ...fn(req), updatedAt: new Date() });
+    tail?.(tx);
+  });
 }
 
 export async function cancelDesignRequest(ownerId: string, requestId: string) {
-  const res = await prisma.designRequest.updateMany({
-    where: { id: requestId, ownerId, status: { in: ["SUBMITTED", "QUOTED", "ACCEPTED"] } },
-    data: { status: "CANCELLED" },
+  await transition(requestId, ownerId, (req) => {
+    if (!["SUBMITTED", "QUOTED", "ACCEPTED"].includes(req.status)) throw new AppError("لا يمكن إلغاء الطلب في هذه المرحلة");
+    return { status: "CANCELLED" };
   });
-  if (res.count !== 1) throw new AppError("لا يمكن إلغاء الطلب في هذه المرحلة");
 }
 
 export async function setDesignInProgress(adminId: string, requestId: string) {
-  const res = await prisma.designRequest.updateMany({ where: { id: requestId, status: "PAID" }, data: { status: "IN_PROGRESS" } });
-  if (res.count !== 1) throw new AppError("الطلب يجب أن يكون مدفوعًا");
-  await audit(prisma, { actorId: adminId, action: "design.in_progress", entityType: "DesignRequest", entityId: requestId });
+  await transition(requestId, undefined, (req) => {
+    if (req.status !== "PAID") throw new AppError("الطلب يجب أن يكون مدفوعًا");
+    return { status: "IN_PROGRESS" };
+  });
+  await audit({ actorId: adminId, action: "design.in_progress", entityType: "DesignRequest", entityId: requestId });
 }
 
 /** تسليم التصميم: يُنشأ قالب خاص بالمنظّم فيظهر له عند اختيار القالب */
@@ -114,24 +165,30 @@ export async function deliverDesign(
   requestId: string,
   input: { name: string; layout: string; palette: Palette },
 ) {
-  const req = await prisma.designRequest.findUnique({ where: { id: requestId } });
-  if (!req) throw new NotFoundError("الطلب غير موجود");
-  if (!["PAID", "IN_PROGRESS"].includes(req.status)) throw new AppError("لا يمكن التسليم قبل الدفع");
-  const tpl = await withTx(async (tx) => {
-    const t = await createTemplateRecord(tx, {
-      name: input.name,
-      layout: input.layout,
-      palette: input.palette,
-      category: "GENERAL",
-      description: `تصميم خاص — ${req.title}`,
-      visibility: "PRIVATE",
-      ownerId: req.ownerId,
-    });
-    await tx.designRequest.update({ where: { id: req.id }, data: { status: "DELIVERED", deliveredTemplateId: t.id } });
-    await audit(tx, { actorId: adminId, action: "design.deliver", entityType: "DesignRequest", entityId: req.id, meta: { templateId: t.id } });
-    return t;
+  const req = await getRequest(requestId);
+  const t = buildTemplate({
+    name: input.name,
+    layout: input.layout,
+    palette: input.palette,
+    category: "GENERAL",
+    description: `تصميم خاص — ${req.title}`,
+    visibility: "PRIVATE",
+    ownerId: req.ownerId,
   });
-  return tpl;
+  await transition(
+    requestId,
+    undefined,
+    (cur) => {
+      if (!["PAID", "IN_PROGRESS"].includes(cur.status)) throw new AppError("لا يمكن التسليم قبل الدفع");
+      return { status: "DELIVERED", deliveredTemplateId: t.id };
+    },
+    (tx) => {
+      const { id, ...data } = t;
+      tx.set(ref(C.templates, id), data);
+      auditTx(tx, { actorId: adminId, action: "design.deliver", entityType: "DesignRequest", entityId: req.id, meta: { templateId: t.id } });
+    },
+  );
+  return t;
 }
 
 // ───────── القوالب ─────────
@@ -157,27 +214,32 @@ type TemplateInput = {
   sortOrder?: number;
 };
 
-async function createTemplateRecord(db: typeof prisma | Parameters<Parameters<typeof withTx>[0]>[0], input: TemplateInput) {
+function buildTemplate(input: TemplateInput): Template {
   if (!input.name.trim()) throw new AppError("اكتب اسم القالب");
   if (!(TEMPLATE_LAYOUTS as readonly string[]).includes(input.layout)) throw new AppError("التخطيط غير معروف");
   const palette = validatePalette(input.palette);
-  return db.template.create({
-    data: {
-      name: input.name.trim(),
-      layout: input.layout,
-      palette: JSON.stringify(palette),
-      category: input.category,
-      description: input.description,
-      visibility: input.visibility,
-      ownerId: input.visibility === "PRIVATE" ? input.ownerId : null,
-      sortOrder: input.sortOrder ?? 100,
-    },
-  });
+  const now = new Date();
+  return {
+    id: newId(),
+    name: input.name.trim(),
+    layout: input.layout,
+    palette: JSON.stringify(palette),
+    category: input.category,
+    description: input.description,
+    status: "ACTIVE",
+    visibility: input.visibility,
+    ownerId: input.visibility === "PRIVATE" ? (input.ownerId ?? null) : null,
+    sortOrder: input.sortOrder ?? 100,
+    createdAt: now,
+    updatedAt: now,
+  };
 }
 
 export async function createTemplate(adminId: string, input: TemplateInput) {
-  const t = await createTemplateRecord(prisma, input);
-  await audit(prisma, { actorId: adminId, action: "template.create", entityType: "Template", entityId: t.id });
+  const t = buildTemplate(input);
+  const { id, ...data } = t;
+  await ref(C.templates, id).set(data);
+  await audit({ actorId: adminId, action: "template.create", entityType: "Template", entityId: t.id });
   return t;
 }
 
@@ -186,7 +248,7 @@ export async function updateTemplate(
   templateId: string,
   input: Partial<Omit<TemplateInput, "palette">> & { palette?: Palette; status?: string },
 ) {
-  const t = await prisma.template.findUnique({ where: { id: templateId } });
+  const t = await getDoc<Template>(C.templates, templateId);
   if (!t) throw new NotFoundError("القالب غير موجود");
   const data: Record<string, unknown> = {};
   if (input.name !== undefined) data.name = input.name.trim();
@@ -202,16 +264,24 @@ export async function updateTemplate(
     data.status = input.status;
   }
   if (input.sortOrder !== undefined) data.sortOrder = input.sortOrder;
-  const updated = await prisma.template.update({ where: { id: t.id }, data });
-  await audit(prisma, { actorId: adminId, action: "template.update", entityType: "Template", entityId: t.id, meta: Object.keys(data) });
-  return updated;
+  data.updatedAt = new Date();
+  await ref(C.templates, t.id).update(data);
+  await audit({ actorId: adminId, action: "template.update", entityType: "Template", entityId: t.id, meta: Object.keys(data) });
+  return { ...t, ...data };
 }
 
 export async function templatesForOrganizer(ownerId: string) {
-  return prisma.template.findMany({
-    where: { status: "ACTIVE", OR: [{ visibility: "PUBLIC" }, { visibility: "PRIVATE", ownerId }] },
-    orderBy: [{ visibility: "desc" }, { sortOrder: "asc" }, { createdAt: "asc" }],
-  });
+  const [pub, mine] = await Promise.all([
+    getDocs<Template>(col(C.templates).where("visibility", "==", "PUBLIC").where("status", "==", "ACTIVE")),
+    getDocs<Template>(col(C.templates).where("ownerId", "==", ownerId).where("status", "==", "ACTIVE")),
+  ]);
+  const sorter = (a: Template, b: Template) => a.sortOrder - b.sortOrder || a.createdAt.getTime() - b.createdAt.getTime();
+  return [...mine.filter((t) => t.visibility === "PRIVATE").sort(sorter), ...pub.sort(sorter)];
+}
+
+export async function listAllTemplates() {
+  const all = await getDocs<Template>(col(C.templates));
+  return all.sort((a, b) => (a.visibility === b.visibility ? a.sortOrder - b.sortOrder : a.visibility === "PUBLIC" ? -1 : 1));
 }
 
 export function parsePalette(json: string): Palette {

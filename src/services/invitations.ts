@@ -1,11 +1,44 @@
 import { z } from "zod";
-import { prisma, withTx, isUniqueViolation } from "@/lib/db";
+import { C, col, ref, db, getDoc, getDocs, newId, runTx, txGet, uniqueRef, type Transaction } from "@/lib/firestore";
 import { AppError, NotFoundError } from "@/lib/errors";
 import { normalizeEmail, normalizePhone } from "@/lib/contact";
 import { randomToken } from "@/lib/ids";
 import { audit } from "@/lib/audit";
 import { getOwnedEvent } from "./events";
 import type { InviteChannel } from "@/lib/constants";
+import type { Invitation, Registration } from "@/lib/types";
+
+const phoneKey = (eventId: string, phone: string) => `inv-phone:${eventId}:${phone}`;
+const emailKey = (eventId: string, email: string) => `inv-email:${eventId}:${email}`;
+const DUP_MSG = "يوجد مدعو بنفس رقم الجوال أو البريد في هذه الفعالية";
+
+/** قيود فريدة لرقم الجوال والبريد داخل الفعالية (مرحلة القراءة) */
+async function readContactUniques(tx: Transaction, eventId: string, phone: string | null, email: string | null) {
+  const [p, e] = await Promise.all([
+    phone ? tx.get(uniqueRef(phoneKey(eventId, phone))) : null,
+    email ? tx.get(uniqueRef(emailKey(eventId, email))) : null,
+  ]);
+  return { phoneOwner: (p?.exists ? p.data()?.ref : null) as string | null, emailOwner: (e?.exists ? e.data()?.ref : null) as string | null };
+}
+
+function newInvitationDoc(eventId: string, d: { name: string; phone: string | null; email: string | null; channel: InviteChannel; allowCompanion: boolean }) {
+  const now = new Date();
+  return {
+    eventId,
+    name: d.name,
+    phone: d.phone,
+    email: d.email,
+    channel: d.channel,
+    allowCompanion: d.allowCompanion,
+    token: randomToken(),
+    deliveryStatus: "NOT_SENT",
+    lastSentAt: null,
+    regStatus: null,
+    registrationId: null,
+    createdAt: now,
+    updatedAt: now,
+  };
+}
 
 /** القناة الفعلية حسب بيانات التواصل المتاحة */
 export function resolveChannel(preferred: InviteChannel, phone: string | null, email: string | null): InviteChannel | null {
@@ -55,60 +88,81 @@ export async function addInvitation(ownerId: string, eventId: string, input: Inv
   assertPrivateEditable(event);
   const v = validateInvite(input);
   if (!v.ok) throw new AppError(v.error);
-  try {
-    return await prisma.invitation.create({ data: { ...v.data, eventId: event.id, token: randomToken() } });
-  } catch (e) {
-    if (isUniqueViolation(e)) throw new AppError("يوجد مدعو بنفس رقم الجوال أو البريد في هذه الفعالية");
-    throw e;
-  }
+  const id = newId();
+  const data = newInvitationDoc(event.id, v.data);
+  await runTx(async (tx) => {
+    const u = await readContactUniques(tx, event.id, v.data.phone, v.data.email);
+    if (u.phoneOwner || u.emailOwner) throw new AppError(DUP_MSG);
+    tx.set(ref(C.invitations, id), data);
+    if (v.data.phone) tx.set(uniqueRef(phoneKey(event.id, v.data.phone)), { ref: id });
+    if (v.data.email) tx.set(uniqueRef(emailKey(event.id, v.data.email)), { ref: id });
+  });
+  return { id, ...data } as Invitation;
+}
+
+async function getOwnedInvitation(ownerId: string, invitationId: string) {
+  const inv = await getDoc<Invitation>(C.invitations, invitationId);
+  if (!inv) throw new NotFoundError("المدعو غير موجود");
+  const event = await getDoc<{ id: string; ownerId: string; mode: string; status: string }>(C.events, inv.eventId);
+  if (!event || event.ownerId !== ownerId) throw new NotFoundError("المدعو غير موجود");
+  return { inv, event };
 }
 
 export async function updateInvitation(ownerId: string, invitationId: string, input: InviteInput) {
-  const inv = await prisma.invitation.findFirst({
-    where: { id: invitationId, event: { ownerId } },
-    include: { registration: true, event: true },
-  });
-  if (!inv) throw new NotFoundError("المدعو غير موجود");
-  assertPrivateEditable(inv.event);
+  const { inv: found, event } = await getOwnedInvitation(ownerId, invitationId);
+  assertPrivateEditable(event);
   const v = validateInvite(input);
   if (!v.ok) throw new AppError(v.error);
-  if (inv.registration?.status === "CONFIRMED" && inv.registration.withCompanion && !v.data.allowCompanion) {
-    throw new AppError("المدعو أكّد حضوره مع مرافق. ألغِ تسجيله أولًا قبل إلغاء خيار المرافق.");
-  }
-  try {
-    return await prisma.invitation.update({ where: { id: inv.id }, data: v.data });
-  } catch (e) {
-    if (isUniqueViolation(e)) throw new AppError("يوجد مدعو آخر بنفس رقم الجوال أو البريد");
-    throw e;
-  }
+  await runTx(async (tx) => {
+    const inv = await txGet<Invitation>(tx, ref(C.invitations, found.id));
+    if (!inv) throw new NotFoundError("المدعو غير موجود");
+    const reg = await txGet<Registration>(tx, ref(C.registrations, `inv_${inv.id}`));
+    const u = await readContactUniques(tx, inv.eventId, v.data.phone, v.data.email);
+    if ((u.phoneOwner && u.phoneOwner !== inv.id) || (u.emailOwner && u.emailOwner !== inv.id)) {
+      throw new AppError("يوجد مدعو آخر بنفس رقم الجوال أو البريد");
+    }
+    if (reg?.status === "CONFIRMED" && reg.withCompanion && !v.data.allowCompanion) {
+      throw new AppError("المدعو أكّد حضوره مع مرافق. ألغِ تسجيله أولًا قبل إلغاء خيار المرافق.");
+    }
+    if (inv.phone && inv.phone !== v.data.phone) tx.delete(uniqueRef(phoneKey(inv.eventId, inv.phone)));
+    if (inv.email && inv.email !== v.data.email) tx.delete(uniqueRef(emailKey(inv.eventId, inv.email)));
+    if (v.data.phone) tx.set(uniqueRef(phoneKey(inv.eventId, v.data.phone)), { ref: inv.id });
+    if (v.data.email) tx.set(uniqueRef(emailKey(inv.eventId, v.data.email)), { ref: inv.id });
+    tx.update(ref(C.invitations, inv.id), { ...v.data, updatedAt: new Date() });
+  });
+  return { ...found, ...v.data };
 }
 
 export async function deleteInvitation(ownerId: string, invitationId: string) {
-  const inv = await prisma.invitation.findFirst({
-    where: { id: invitationId, event: { ownerId } },
-    include: { registration: true },
+  const { inv: found } = await getOwnedInvitation(ownerId, invitationId);
+  await runTx(async (tx) => {
+    const inv = await txGet<Invitation>(tx, ref(C.invitations, found.id));
+    if (!inv) return;
+    const reg = await txGet<Registration>(tx, ref(C.registrations, `inv_${inv.id}`));
+    if (reg && ["CONFIRMED", "WAITLISTED", "OFFERED"].includes(reg.status)) {
+      throw new AppError("لا يمكن حذف مدعو لديه تسجيل نشط. ألغِ تسجيله أولًا.");
+    }
+    if (inv.phone) tx.delete(uniqueRef(phoneKey(inv.eventId, inv.phone)));
+    if (inv.email) tx.delete(uniqueRef(emailKey(inv.eventId, inv.email)));
+    if (reg) tx.delete(ref(C.registrations, reg.id));
+    tx.delete(ref(C.invitations, inv.id));
   });
-  if (!inv) throw new NotFoundError("المدعو غير موجود");
-  if (inv.registration && ["CONFIRMED", "WAITLISTED", "OFFERED"].includes(inv.registration.status)) {
-    throw new AppError("لا يمكن حذف مدعو لديه تسجيل نشط. ألغِ تسجيله أولًا.");
-  }
-  await prisma.invitation.delete({ where: { id: inv.id } });
-  await audit(prisma, { actorId: ownerId, action: "invitation.delete", entityType: "Invitation", entityId: inv.id });
+  await audit({ actorId: ownerId, action: "invitation.delete", entityType: "Invitation", entityId: found.id });
 }
 
 /** تطبيق قناة الإرسال على القائمة كاملة مع مراعاة بيانات التواصل المتاحة لكل مدعو */
 export async function setChannelForAll(ownerId: string, eventId: string, channel: InviteChannel) {
   const event = await getOwnedEvent(eventId, ownerId);
   assertPrivateEditable(event);
-  const invs = await prisma.invitation.findMany({ where: { eventId: event.id } });
+  const invs = await getDocs<Invitation>(col(C.invitations).where("eventId", "==", event.id));
   let adjusted = 0;
-  await withTx(async (tx) => {
-    for (const inv of invs) {
-      const resolved = resolveChannel(channel, inv.phone, inv.email)!;
-      if (resolved !== channel) adjusted++;
-      if (resolved !== inv.channel) await tx.invitation.update({ where: { id: inv.id }, data: { channel: resolved } });
-    }
-  });
+  const writer = db().bulkWriter();
+  for (const inv of invs) {
+    const resolved = resolveChannel(channel, inv.phone, inv.email)!;
+    if (resolved !== channel) adjusted++;
+    if (resolved !== inv.channel) writer.update(ref(C.invitations, inv.id), { channel: resolved, updatedAt: new Date() });
+  }
+  await writer.close();
   return { total: invs.length, adjusted };
 }
 
@@ -138,7 +192,7 @@ export function parseCompanion(v: string): boolean {
  * تصنيف صفوف الاستيراد: مقبول / مكرر (داخل الملف أو مع المدعوين الحاليين) / يحتاج تصحيحًا.
  */
 export async function classifyImportRows(eventId: string, rows: ImportRow[], defaultChannel: InviteChannel = "WHATSAPP") {
-  const existing = await prisma.invitation.findMany({ where: { eventId }, select: { phone: true, email: true } });
+  const existing = await getDocs<Invitation>(col(C.invitations).where("eventId", "==", eventId));
   const seenPhones = new Set(existing.map((e) => e.phone).filter(Boolean) as string[]);
   const seenEmails = new Set(existing.map((e) => e.email).filter(Boolean) as string[]);
   const filePhones = new Map<string, number>();
@@ -191,29 +245,34 @@ export async function commitImport(ownerId: string, eventId: string, rows: Impor
   const preview = await classifyImportRows(event.id, rows, channel);
   const accepted = preview.rows.filter((r) => r.status === "ACCEPTED");
   let added = 0;
-  await withTx(async (tx) => {
-    for (const r of accepted) {
-      const n = r.normalized!;
-      await tx.invitation.create({
-        data: {
-          eventId: event.id,
-          name: n.name,
-          phone: n.phone,
-          email: n.email,
-          allowCompanion: n.allowCompanion,
-          channel: resolveChannel(channel, n.phone, n.email)!,
-          token: randomToken(),
-        },
-      });
-      added++;
-    }
-  });
-  await audit(prisma, {
+  let raced = 0;
+  // كل صف دفعة ذرّية مستقلة: القيود الفريدة تُنشأ بـ create فتفشل الدفعة إن سبقها إدخال مطابق
+  const CONCURRENCY = 20;
+  for (let i = 0; i < accepted.length; i += CONCURRENCY) {
+    await Promise.all(
+      accepted.slice(i, i + CONCURRENCY).map(async (r) => {
+        const n = r.normalized!;
+        const id = newId();
+        const b = db().batch();
+        b.set(ref(C.invitations, id), newInvitationDoc(event.id, { ...n, channel: resolveChannel(channel, n.phone, n.email)! }));
+        if (n.phone) b.create(uniqueRef(phoneKey(event.id, n.phone)), { ref: id });
+        if (n.email) b.create(uniqueRef(emailKey(event.id, n.email)), { ref: id });
+        try {
+          await b.commit();
+          added++;
+        } catch (e) {
+          if ((e as { code?: number }).code === 6) raced++;
+          else throw e;
+        }
+      }),
+    );
+  }
+  await audit({
     actorId: ownerId,
     action: "invitation.import",
     entityType: "Event",
     entityId: event.id,
-    meta: { added, duplicates: preview.duplicates, invalid: preview.invalid },
+    meta: { added, duplicates: preview.duplicates + raced, invalid: preview.invalid },
   });
-  return { added, duplicates: preview.duplicates, invalid: preview.invalid };
+  return { added, duplicates: preview.duplicates + raced, invalid: preview.invalid };
 }

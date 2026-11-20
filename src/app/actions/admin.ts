@@ -2,7 +2,7 @@
 
 import { assertAdmin } from "@/lib/auth";
 import { act, bool, str } from "@/lib/actions";
-import { prisma } from "@/lib/db";
+import { C, ref, newId, getDoc } from "@/lib/firestore";
 import { AppError } from "@/lib/errors";
 import { parseMoney } from "@/lib/format";
 import { audit } from "@/lib/audit";
@@ -20,7 +20,6 @@ import {
 } from "@/services/designs";
 import { addSupportComment, setSupportStatus } from "@/services/support";
 import { creditWallet } from "@/services/wallet";
-import { withTx } from "@/lib/db";
 import { randomToken } from "@/lib/ids";
 
 function palette(fd: FormData): Palette {
@@ -51,18 +50,16 @@ export async function adjustWalletAction(fd: FormData) {
     if (!amount) throw new AppError("أدخل مبلغًا صحيحًا");
     if (reason.length < 3) throw new AppError("اكتب سبب التسوية");
     const userId = str(fd, "userId");
-    await withTx(async (tx) => {
-      const wallet = await tx.wallet.findUnique({ where: { userId } });
-      if (sign < 0 && (!wallet || wallet.balance < amount)) throw new AppError("الرصيد لا يكفي للخصم");
-      await creditWallet(tx, {
+    {
+      await creditWallet({
         userId,
         amount: sign * amount,
         type: "ADJUSTMENT",
         description: `تسوية من الأدمن: ${reason}`,
         idempotencyKey: `adj:${randomToken(10)}`,
       });
-      await audit(tx, { actorId: admin.id, action: "wallet.adjust", entityType: "User", entityId: userId, meta: { amount: sign * amount, reason } });
-    });
+      await audit({ actorId: admin.id, action: "wallet.adjust", entityType: "User", entityId: userId, meta: { amount: sign * amount, reason } });
+    }
     return "سُجّلت التسوية";
   });
 }
@@ -175,8 +172,10 @@ export async function savePlanAction(fd: FormData) {
     if (!Number.isInteger(places) || places < 1) throw new AppError("عدد الأماكن غير صالح");
     if (price === null) throw new AppError("السعر غير صالح");
     const data = { name, places, price, active: bool(fd, "active"), isDemo: bool(fd, "isDemo"), sortOrder: places };
-    const plan = id ? await prisma.pricingPlan.update({ where: { id }, data }) : await prisma.pricingPlan.create({ data });
-    await audit(prisma, { actorId: admin.id, action: id ? "plan.update" : "plan.create", entityType: "PricingPlan", entityId: plan.id, meta: data });
+    const planId = id || newId();
+    if (id && !(await getDoc(C.pricingPlans, id))) throw new AppError("الباقة غير موجودة");
+    await ref(C.pricingPlans, planId).set({ ...data, updatedAt: new Date(), ...(id ? {} : { createdAt: new Date() }) }, { merge: true });
+    await audit({ actorId: admin.id, action: id ? "plan.update" : "plan.create", entityType: "PricingPlan", entityId: planId, meta: data });
     return "حُفظت الباقة";
   });
 }

@@ -1,4 +1,4 @@
-import { prisma } from "@/lib/db";
+import { adminUsers } from "@/services/queries";
 import { formatDateTime } from "@/lib/format";
 import { Flash, PageHeader, Badge, Money } from "@/components/ui";
 import { SubmitButton } from "@/components/client";
@@ -9,15 +9,7 @@ export const metadata = { title: "الحسابات" };
 export default async function AdminUsers({ searchParams }: { searchParams: Promise<Record<string, string>> }) {
   const sp = await searchParams;
   const q = (sp.q ?? "").trim().toLowerCase();
-  const users = await prisma.user.findMany({
-    where: q ? { OR: [{ email: { contains: q } }, { name: { contains: q } }] } : {},
-    orderBy: { createdAt: "desc" },
-    take: 200,
-    include: {
-      wallet: true,
-      _count: { select: { events: true, staffAssignments: true } },
-    },
-  });
+  const users = await adminUsers(q);
   return (
     <div className="stack">
       <Flash sp={sp} />

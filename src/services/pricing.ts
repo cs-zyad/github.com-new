@@ -1,5 +1,5 @@
-import type { Event, PricingPlan } from "@prisma/client";
-import { prisma, type Db } from "@/lib/db";
+import { C, col, getDocs } from "@/lib/firestore";
+import type { Event, PricingPlan } from "@/lib/types";
 import { getSettings } from "@/lib/settings";
 import { requiredPlaces } from "./events";
 
@@ -33,14 +33,14 @@ export type PackageQuote =
  * أول دفع يختار أصغر باقة تغطي العدد (وإن تجاوز أكبر باقة تُضاف أماكن بسعر المكان الإضافي).
  * بعد الدفع: أي زيادة تُحسب بسعر المكان الإضافي.
  */
-export async function quotePackage(event: Event, db: Db = prisma): Promise<PackageQuote> {
-  const needed = await requiredPlaces(event, db);
-  const settings = await getSettings(db);
+export async function quotePackage(event: Event): Promise<PackageQuote> {
+  const needed = await requiredPlaces(event);
+  const settings = await getSettings();
   if (needed <= event.paidPlaces && event.paidPlaces > 0) return { kind: "NONE", needed, paidPlaces: event.paidPlaces };
   if (needed === 0) return { kind: "NONE", needed, paidPlaces: event.paidPlaces };
 
   if (event.paidPlaces === 0) {
-    const plans = await db.pricingPlan.findMany({ where: { active: true }, orderBy: { places: "asc" } });
+    const plans = (await getDocs<PricingPlan>(col(C.pricingPlans).where("active", "==", true))).sort((a, b) => a.places - b.places);
     if (plans.length === 0) throw new Error("لا توجد باقات مفعّلة. أضف باقة من لوحة الأدمن.");
     const fit = plans.find((p) => p.places >= needed);
     const plan = fit ?? plans[plans.length - 1];

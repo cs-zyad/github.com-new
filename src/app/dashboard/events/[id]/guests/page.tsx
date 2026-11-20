@@ -1,7 +1,6 @@
 import Link from "next/link";
-import type { Prisma } from "@prisma/client";
 import { requireUser } from "@/lib/auth";
-import { prisma } from "@/lib/db";
+import { privateGuests, publicRegistrations } from "@/services/queries";
 import { getOwnedEvent } from "@/services/events";
 import { links } from "@/services/presentation";
 import { displayPhone } from "@/lib/contact";
@@ -75,13 +74,16 @@ export default async function GuestsPage({
   const editable = event.status !== "CANCELLED" && event.status !== "ENDED";
 
   if (event.mode === "PUBLIC") {
-    const where: Prisma.RegistrationWhereInput = { eventId: event.id };
-    if (filter === "confirmed") where.status = "CONFIRMED";
-    if (filter === "waitlist") where.status = { in: ["WAITLISTED", "OFFERED"] };
-    if (filter === "declined") where.status = { in: ["CANCELLED", "DECLINED"] };
-    if (filter === "attended") where.tickets = { some: { checkedInAt: { not: null } } };
-    if (q) where.OR = [{ name: { contains: q } }, { phone: { contains: q.replace(/^0/, "") } }, { email: { contains: q.toLowerCase() } }];
-    const regs = await prisma.registration.findMany({ where, orderBy: { createdAt: "desc" }, include: { tickets: true }, take: 500 });
+    const regs = (await publicRegistrations(event.id))
+      .filter((r) => {
+        if (filter === "confirmed") return r.status === "CONFIRMED";
+        if (filter === "waitlist") return r.status === "WAITLISTED" || r.status === "OFFERED";
+        if (filter === "declined") return r.status === "CANCELLED" || r.status === "DECLINED";
+        if (filter === "attended") return r.tickets.some((t) => t.checkedInAt);
+        return true;
+      })
+      .filter((r) => matchesQuery(r, q))
+      .slice(0, 500);
     return (
       <div className="stack">
         <Flash sp={sp} />
@@ -126,24 +128,21 @@ export default async function GuestsPage({
   }
 
   // ───── الدعوات الخاصة ─────
-  const where: Prisma.InvitationWhereInput = { eventId: event.id };
-  if (filter === "not_confirmed") where.registration = null;
-  if (filter === "confirmed") where.registration = { status: "CONFIRMED" };
-  if (filter === "declined") where.registration = { status: { in: ["DECLINED", "CANCELLED"] } };
-  if (filter === "attended") where.registration = { tickets: { some: { checkedInAt: { not: null } } } };
-  if (filter === "failed") where.deliveryStatus = "FAILED";
-  if (filter === "not_sent") where.deliveryStatus = "NOT_SENT";
-  if (q) where.OR = [{ name: { contains: q } }, { phone: { contains: q.replace(/^0/, "") } }, { email: { contains: q.toLowerCase() } }];
-
-  const [invitations, total] = await Promise.all([
-    prisma.invitation.findMany({
-      where,
-      orderBy: { createdAt: "asc" },
-      include: { registration: { include: { tickets: true } } },
-      take: 1000,
-    }),
-    prisma.invitation.count({ where: { eventId: event.id } }),
-  ]);
+  const all = await privateGuests(event.id);
+  const total = all.length;
+  const invitations = all
+    .filter((inv) => {
+      const reg = inv.registration;
+      if (filter === "not_confirmed") return !reg;
+      if (filter === "confirmed") return reg?.status === "CONFIRMED";
+      if (filter === "declined") return reg?.status === "DECLINED" || reg?.status === "CANCELLED";
+      if (filter === "attended") return !!reg?.tickets.some((t) => t.checkedInAt);
+      if (filter === "failed") return inv.deliveryStatus === "FAILED";
+      if (filter === "not_sent") return inv.deliveryStatus === "NOT_SENT";
+      return true;
+    })
+    .filter((inv) => matchesQuery(inv, q))
+    .slice(0, 1000);
 
   return (
     <div className="stack">
@@ -278,6 +277,12 @@ export default async function GuestsPage({
       )}
     </div>
   );
+}
+
+function matchesQuery(r: { name: string; phone: string | null; email: string | null }, q: string) {
+  if (!q) return true;
+  const digits = q.replace(/\D/g, "").replace(/^0+/, "");
+  return r.name.includes(q) || (digits.length >= 3 && !!r.phone?.includes(digits)) || !!r.email?.includes(q.toLowerCase());
 }
 
 function Filters({ filters, active, base, q }: { filters: { key: string; label: string }[]; active: string; base: string; q: string }) {

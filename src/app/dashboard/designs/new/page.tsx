@@ -1,5 +1,5 @@
 import { requireUser } from "@/lib/auth";
-import { prisma } from "@/lib/db";
+import { ownerEventOptions } from "@/services/queries";
 import { Flash, PageHeader } from "@/components/ui";
 import { SubmitButton } from "@/components/client";
 import { createDesignRequestAction } from "@/app/actions/account";
@@ -9,7 +9,7 @@ export const metadata = { title: "طلب تصميم خاص" };
 export default async function NewDesignPage({ searchParams }: { searchParams: Promise<Record<string, string>> }) {
   const sp = await searchParams;
   const user = await requireUser();
-  const events = await prisma.event.findMany({ where: { ownerId: user.id, status: { in: ["DRAFT", "ACTIVE"] } }, orderBy: { startsAt: "asc" } });
+  const events = (await ownerEventOptions(user.id)).filter((e) => e.status === "DRAFT" || e.status === "ACTIVE");
   return (
     <div className="stack">
       <Flash sp={sp} />

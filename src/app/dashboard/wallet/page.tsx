@@ -1,8 +1,7 @@
 import Link from "next/link";
 import { requireUser } from "@/lib/auth";
-import { prisma } from "@/lib/db";
+import { walletPage } from "@/services/queries";
 import { getSettings } from "@/lib/settings";
-import { ensureWallet } from "@/services/wallet";
 import { formatDateTime } from "@/lib/format";
 import { walletTxLabel, paymentPurposeLabel, paymentStatusLabel } from "@/lib/labels";
 import { Flash, Money, PageHeader, Badge, Empty } from "@/components/ui";
@@ -14,12 +13,8 @@ export const metadata = { title: "الرصيد والمدفوعات" };
 export default async function WalletPage({ searchParams }: { searchParams: Promise<Record<string, string>> }) {
   const sp = await searchParams;
   const user = await requireUser();
-  const wallet = await ensureWallet(user.id);
-  const [txs, payments, settings] = await Promise.all([
-    prisma.walletTransaction.findMany({ where: { walletId: wallet.id }, orderBy: { createdAt: "desc" }, take: 50 }),
-    prisma.payment.findMany({ where: { ownerId: user.id }, orderBy: { createdAt: "desc" }, take: 50, include: { event: { select: { title: true } } } }),
-    getSettings(),
-  ]);
+  const [{ balance, txs, payments }, settings] = await Promise.all([walletPage(user.id), getSettings()]);
+  const wallet = { balance };
   return (
     <div className="stack">
       <Flash sp={sp} />

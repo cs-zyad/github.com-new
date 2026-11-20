@@ -1,4 +1,4 @@
-import { prisma } from "@/lib/db";
+import { adminMessages } from "@/services/queries";
 import { formatDateTime } from "@/lib/format";
 import { messageKindLabel, messageStatusLabel, channelLabel, billingLabel } from "@/lib/labels";
 import { PageHeader, Badge, Money, Stat } from "@/components/ui";
@@ -6,14 +6,9 @@ import { PageHeader, Badge, Money, Stat } from "@/components/ui";
 export const metadata = { title: "الرسائل والتكلفة" };
 
 export default async function AdminMessages() {
-  const [byBilling, byStatus, recent] = await Promise.all([
-    prisma.message.groupBy({ by: ["billing", "channel"], where: { status: "SENT" }, _count: { _all: true }, _sum: { cost: true, operatingCost: true } }),
-    prisma.message.groupBy({ by: ["status"], _count: { _all: true } }),
-    prisma.message.findMany({ orderBy: { createdAt: "desc" }, take: 100, include: { owner: { select: { name: true } } } }),
-  ]);
-  const st = Object.fromEntries(byStatus.map((s) => [s.status, s._count._all]));
-  const walletRevenue = byBilling.filter((b) => b.billing === "WALLET").reduce((s, b) => s + (b._sum.cost ?? 0), 0);
-  const packageCost = byBilling.filter((b) => b.billing === "PACKAGE").reduce((s, b) => s + (b._sum.operatingCost ?? 0), 0);
+  const { byBilling, st, recent } = await adminMessages();
+  const walletRevenue = byBilling.filter((b) => b.billing === "WALLET").reduce((s, b) => s + b.cost, 0);
+  const packageCost = byBilling.filter((b) => b.billing === "PACKAGE").reduce((s, b) => s + b.operatingCost, 0);
   return (
     <div className="stack">
       <PageHeader
@@ -43,12 +38,12 @@ export default async function AdminMessages() {
               <tr key={`${b.billing}-${b.channel}`}>
                 <td>{billingLabel[b.billing]}</td>
                 <td>{channelLabel[b.channel]}</td>
-                <td className="num">{b._count._all}</td>
+                <td className="num">{b.count}</td>
                 <td className="num">
-                  <Money value={b._sum.cost ?? 0} />
+                  <Money value={b.cost} />
                 </td>
                 <td className="num">
-                  <Money value={b._sum.operatingCost ?? 0} />
+                  <Money value={b.operatingCost} />
                 </td>
               </tr>
             ))}

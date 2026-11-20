@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import ExcelJS from "exceljs";
-import { prisma } from "@/lib/db";
+import { store } from "./db";
 import { classifyImportRows, commitImport, addInvitation, updateInvitation, deleteInvitation } from "@/services/invitations";
 import { parseInviteeFile, buildTemplateWorkbook } from "@/services/importFile";
 import { getOwnedEvent, updateEvent } from "@/services/events";
@@ -63,7 +63,7 @@ describe("استيراد المدعوين", () => {
       "BOTH",
     );
     expect(r.added).toBe(1);
-    const inv = await prisma.invitation.findFirstOrThrow({ where: { eventId: event.id } });
+    const inv = await store.invitation.findFirstOrThrow({ where: { eventId: event.id } });
     expect(inv.channel).toBe("BOTH");
     expect(inv.phone).toBe("+966501234567");
   });
@@ -107,7 +107,7 @@ describe("عزل بيانات المنظّمين", () => {
       withCompanion: false,
     });
     if (c.status !== "CONFIRMED") throw new Error();
-    const regA = await prisma.registration.findUniqueOrThrow({ where: { accessToken: c.accessToken } });
+    const regA = await store.registration.findUniqueOrThrow({ where: { accessToken: c.accessToken } });
 
     await expect(getOwnedEvent(eventA.id, b.id)).rejects.toBeInstanceOf(NotFoundError);
     await expect(
@@ -126,6 +126,6 @@ describe("عزل بيانات المنظّمين", () => {
     await expect(cancelByOrganizer(b.id, regA.id)).rejects.toBeInstanceOf(NotFoundError);
     await expect(sendInvitations(b.id, eventA.id, { target: "NOT_SENT", batchKey: "zz" })).rejects.toBeInstanceOf(NotFoundError);
     await expect(addStaff(b.id, eventA.id, { name: "x", email: "x@x.com" })).rejects.toBeInstanceOf(NotFoundError);
-    expect((await prisma.registration.findUniqueOrThrow({ where: { id: regA.id } })).status).toBe("CONFIRMED");
+    expect((await store.registration.findUniqueOrThrow({ where: { id: regA.id } })).status).toBe("CONFIRMED");
   });
 });

@@ -1,6 +1,6 @@
 import Link from "next/link";
 import { requireUser } from "@/lib/auth";
-import { prisma } from "@/lib/db";
+import { recentCheckIns } from "@/services/checkin";
 import { getOwnedEvent, eventStats } from "@/services/events";
 import { links } from "@/services/presentation";
 import { formatDateTime, formatTime } from "@/lib/format";
@@ -21,12 +21,7 @@ export default async function EventOverview({
   const event = await getOwnedEvent(id, user.id);
   const s = await eventStats(event);
   const base = `/dashboard/events/${event.id}`;
-  const recent = await prisma.ticket.findMany({
-    where: { eventId: event.id, checkedInAt: { not: null } },
-    orderBy: { checkedInAt: "desc" },
-    take: 6,
-    include: { registration: { select: { name: true } }, checkedInBy: { select: { name: true } } },
-  });
+  const recent = await recentCheckIns(event.id, 6);
 
   const isPrivate = event.mode === "PRIVATE";
   const paid = event.paidPlaces > 0;
@@ -140,11 +135,11 @@ export default async function EventOverview({
               {recent.map((t) => (
                 <div key={t.id} className="row-between small">
                   <span>
-                    {t.kind === "COMPANION" ? `مرافق — ${t.registration.name}` : t.holderName}{" "}
+                    {t.kind === "COMPANION" ? `مرافق — ${t.primaryName}` : t.holderName}{" "}
                     <Badge tone="neutral">{checkInMethodLabel[t.checkInMethod ?? "SCAN"]}</Badge>
                   </span>
                   <span className="muted">
-                    {formatTime(t.checkedInAt, event.timezone)} · {t.checkedInBy?.name}
+                    {formatTime(t.checkedInAt, event.timezone)} · {t.checkedInByName}
                   </span>
                 </div>
               ))}

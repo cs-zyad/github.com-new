@@ -9,9 +9,12 @@ export async function register() {
   if (process.env.VERCEL) return;
   const g = globalThis as unknown as { __wafdaWorker?: NodeJS.Timeout };
   if (g.__wafdaWorker) return;
+  const { firebaseConfigured } = await import("./lib/firestore");
+  if (!firebaseConfigured()) {
+    console.warn("[wafda] Firebase غير مضبوط — العامل لن يبدأ");
+    return;
+  }
   const { workerTick } = await import("./services/worker");
-  const { ensureDbReady } = await import("./lib/db");
-  await ensureDbReady();
   g.__wafdaWorker = setInterval(() => {
     workerTick().catch((e) => console.error("[worker]", e));
   }, 15_000);

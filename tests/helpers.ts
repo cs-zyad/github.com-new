@@ -1,34 +1,18 @@
-import { prisma } from "@/lib/db";
+import { C, ref, newId, uniqueRef } from "@/lib/firestore";
 import { randomToken } from "@/lib/ids";
 import { hashPassword } from "@/lib/password";
 import { DEFAULT_SETTINGS } from "@/lib/settings";
 import { creditWallet } from "@/services/wallet";
+import { createUser } from "@/services/accounts";
+import type { Event, Invitation } from "@/lib/types";
 
+/** مسح كل بيانات المحاكي (قاعدة الاختبار فقط — لا يعمل إلا مع محاكي Firestore) */
 export async function resetDb() {
-  // ترتيب الحذف يراعي العلاقات
-  await prisma.checkInLog.deleteMany();
-  await prisma.ticket.deleteMany();
-  await prisma.message.deleteMany();
-  await prisma.messageBatch.deleteMany();
-  await prisma.registration.deleteMany();
-  await prisma.invitation.deleteMany();
-  await prisma.scheduledJob.deleteMany();
-  await prisma.eventStaff.deleteMany();
-  await prisma.paymentEvent.deleteMany();
-  await prisma.payment.deleteMany();
-  await prisma.comment.deleteMany();
-  await prisma.designRequest.deleteMany();
-  await prisma.supportTicket.deleteMany();
-  await prisma.event.deleteMany();
-  await prisma.template.deleteMany();
-  await prisma.walletTransaction.deleteMany();
-  await prisma.wallet.deleteMany();
-  await prisma.auditLog.deleteMany();
-  await prisma.authToken.deleteMany();
-  await prisma.session.deleteMany();
-  await prisma.user.deleteMany();
-  await prisma.pricingPlan.deleteMany();
-  await prisma.setting.deleteMany();
+  const host = process.env.FIRESTORE_EMULATOR_HOST;
+  if (!host) throw new Error("الاختبارات تعمل على محاكي Firestore فقط");
+  const project = process.env.FIREBASE_PROJECT_ID || "demo-wafda";
+  const res = await fetch(`http://${host}/emulator/v1/projects/${project}/databases/(default)/documents`, { method: "DELETE" });
+  if (!res.ok) throw new Error("تعذّر مسح بيانات المحاكي: " + res.status);
 }
 
 let counter = 0;
@@ -37,25 +21,29 @@ export function uniq() {
   return `${Date.now().toString(36)}${counter}`;
 }
 
+let cachedHash: string | null = null;
 export async function makeUser(opts: { role?: string; name?: string; email?: string } = {}) {
-  return prisma.user.create({
-    data: {
-      email: opts.email ?? `u${uniq()}@test.local`,
-      name: opts.name ?? "مستخدم",
-      role: opts.role ?? "USER",
-      passwordHash: await hashPassword("Passw0rd!"),
-    },
-  });
+  cachedHash ??= await hashPassword("Passw0rd!");
+  return createUser({ email: opts.email ?? `u${uniq()}@test.local`, name: opts.name ?? "مستخدم", role: opts.role ?? "USER", passwordHash: cachedHash });
 }
 
 export async function makeTemplate() {
-  return prisma.template.create({
-    data: {
-      name: "قالب",
-      layout: "plum-frame",
-      palette: JSON.stringify({ primary: "#28182C", accent: "#DDF480", background: "#FBF7EF", text: "#28182C", muted: "#65586B" }),
-    },
+  const id = newId();
+  const now = new Date();
+  await ref(C.templates, id).set({
+    name: "قالب",
+    description: "",
+    category: "GENERAL",
+    layout: "plum-frame",
+    palette: JSON.stringify({ primary: "#28182C", accent: "#DDF480", background: "#FBF7EF", text: "#28182C", muted: "#65586B" }),
+    status: "ACTIVE",
+    visibility: "PUBLIC",
+    ownerId: null,
+    sortOrder: 1,
+    createdAt: now,
+    updatedAt: now,
   });
+  return { id };
 }
 
 export async function makeEvent(
@@ -68,24 +56,35 @@ export async function makeEvent(
     status: string;
     templateId: string | null;
   }> = {},
-) {
+): Promise<Event> {
   const mode = opts.mode ?? "PRIVATE";
-  return prisma.event.create({
-    data: {
-      ownerId,
-      title: "فعالية اختبار",
-      hostName: "الجهة",
-      startsAt: new Date(Date.now() + 7 * 86400000),
-      venueName: "القاعة",
-      mode,
-      capacity: opts.capacity ?? 10,
-      paidPlaces: opts.paidPlaces ?? 100,
-      fullPolicy: opts.fullPolicy ?? "CLOSE",
-      status: opts.status ?? "ACTIVE",
-      templateId: opts.templateId ?? null,
-      publicSlug: mode === "PUBLIC" ? randomToken(9) : null,
-    },
-  });
+  const id = newId();
+  const now = new Date();
+  const e: Omit<Event, "id"> = {
+    ownerId,
+    title: "فعالية اختبار",
+    hostName: "الجهة",
+    description: "",
+    startsAt: new Date(Date.now() + 7 * 86400000),
+    endsAt: null,
+    timezone: "Asia/Riyadh",
+    venueName: "القاعة",
+    venueAddress: "",
+    mapUrl: null,
+    mode,
+    capacity: opts.capacity ?? 10,
+    paidPlaces: opts.paidPlaces ?? 100,
+    reservedSeats: 0,
+    fullPolicy: opts.fullPolicy ?? "CLOSE",
+    status: opts.status ?? "ACTIVE",
+    templateId: opts.templateId ?? null,
+    publicSlug: mode === "PUBLIC" ? randomToken(9) : null,
+    publishedAt: null,
+    createdAt: now,
+    updatedAt: now,
+  };
+  await ref(C.events, id).set(e);
+  return { id, ...e };
 }
 
 let phoneSeq = 100000;
@@ -97,36 +96,44 @@ export function nextPhone() {
 export async function makeInvitation(
   eventId: string,
   opts: Partial<{ name: string; phone: string | null; email: string | null; allowCompanion: boolean; channel: string; deliveryStatus: string }> = {},
-) {
+): Promise<Invitation> {
   const phone = opts.phone === undefined ? `+9665${String(10000000 + ++phoneSeq).slice(-8)}` : opts.phone;
-  return prisma.invitation.create({
-    data: {
-      eventId,
-      name: opts.name ?? "مدعو",
-      phone,
-      email: opts.email ?? null,
-      channel: opts.channel ?? (phone ? "WHATSAPP" : "EMAIL"),
-      allowCompanion: opts.allowCompanion ?? false,
-      deliveryStatus: opts.deliveryStatus ?? "NOT_SENT",
-      token: randomToken(),
-    },
-  });
+  const id = newId();
+  const now = new Date();
+  const inv: Omit<Invitation, "id"> = {
+    eventId,
+    name: opts.name ?? "مدعو",
+    phone,
+    email: opts.email ?? null,
+    channel: opts.channel ?? (phone ? "WHATSAPP" : "EMAIL"),
+    allowCompanion: opts.allowCompanion ?? false,
+    deliveryStatus: opts.deliveryStatus ?? "NOT_SENT",
+    token: randomToken(),
+    lastSentAt: null,
+    regStatus: null,
+    registrationId: null,
+    createdAt: now,
+    updatedAt: now,
+  };
+  await ref(C.invitations, id).set(inv);
+  if (inv.phone) await uniqueRef(`inv-phone:${eventId}:${inv.phone}`).set({ ref: id });
+  if (inv.email) await uniqueRef(`inv-email:${eventId}:${inv.email}`).set({ ref: id });
+  return { id, ...inv };
 }
 
 export async function topUp(userId: string, amount: number) {
-  await prisma.$transaction((tx) =>
-    creditWallet(tx, { userId, amount, type: "ADJUSTMENT", description: "test", idempotencyKey: `t:${uniq()}` }),
-  );
+  await creditWallet({ userId, amount, type: "ADJUSTMENT", description: "test", idempotencyKey: `t:${uniq()}` });
 }
 
 export async function seedPlans() {
-  await prisma.pricingPlan.createMany({
-    data: [
-      { name: "صغيرة", places: 50, price: 9900, sortOrder: 1 },
-      { name: "متوسطة", places: 100, price: 17900, sortOrder: 2 },
-      { name: "كبيرة", places: 250, price: 39900, sortOrder: 3 },
-    ],
-  });
+  const now = new Date();
+  for (const p of [
+    { name: "صغيرة", places: 50, price: 9900, sortOrder: 1 },
+    { name: "متوسطة", places: 100, price: 17900, sortOrder: 2 },
+    { name: "كبيرة", places: 250, price: 39900, sortOrder: 3 },
+  ]) {
+    await ref(C.pricingPlans, newId()).set({ ...p, active: true, isDemo: true, createdAt: now, updatedAt: now });
+  }
 }
 
 export const settings = DEFAULT_SETTINGS;

@@ -2,7 +2,8 @@ import "server-only";
 import { cache } from "react";
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
-import { prisma } from "./db";
+import { C, ref, getDoc } from "./firestore";
+import type { Session, User } from "./types";
 import { randomToken, sha256 } from "./ids";
 import { env } from "./env";
 import { ForbiddenError } from "./errors";
@@ -21,7 +22,7 @@ export type CurrentUser = {
 export async function createSession(userId: string) {
   const token = randomToken(32);
   const expiresAt = new Date(Date.now() + SESSION_DAYS * 24 * 3600 * 1000);
-  await prisma.session.create({ data: { tokenHash: sha256(token), userId, expiresAt } });
+  await ref(C.sessions, sha256(token)).set({ userId, expiresAt, createdAt: new Date() });
   const jar = await cookies();
   jar.set(SESSION_COOKIE, token, {
     httpOnly: true,
@@ -36,7 +37,7 @@ export async function destroySession() {
   const jar = await cookies();
   const token = jar.get(SESSION_COOKIE)?.value;
   if (token) {
-    await prisma.session.deleteMany({ where: { tokenHash: sha256(token) } });
+    await ref(C.sessions, sha256(token)).delete();
   }
   jar.delete(SESSION_COOKIE);
 }
@@ -46,13 +47,11 @@ export const getCurrentUser = cache(async (): Promise<CurrentUser | null> => {
   const jar = await cookies();
   const token = jar.get(SESSION_COOKIE)?.value;
   if (!token) return null;
-  const session = await prisma.session.findUnique({
-    where: { tokenHash: sha256(token) },
-    include: { user: { select: { id: true, name: true, email: true, role: true, status: true } } },
-  });
+  const session = await getDoc<Session>(C.sessions, sha256(token));
   if (!session || session.expiresAt < new Date()) return null;
-  if (session.user.status !== "ACTIVE") return null;
-  return session.user;
+  const user = await getDoc<User>(C.users, session.userId);
+  if (!user || user.status !== "ACTIVE") return null;
+  return { id: user.id, name: user.name, email: user.email, role: user.role, status: user.status };
 });
 
 /** للصفحات: يحوّل لتسجيل الدخول إذا لم يكن هناك مستخدم */

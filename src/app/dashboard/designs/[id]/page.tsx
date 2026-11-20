@@ -1,7 +1,7 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { requireUser } from "@/lib/auth";
-import { prisma } from "@/lib/db";
+import { designRequestDetail } from "@/services/queries";
 import { formatDateTime } from "@/lib/format";
 import { designStatusLabel } from "@/lib/labels";
 import { Flash, PageHeader, Badge, Money } from "@/components/ui";
@@ -18,14 +18,7 @@ export default async function DesignDetail({
 }) {
   const [{ id }, sp] = await Promise.all([params, searchParams]);
   const user = await requireUser();
-  const r = await prisma.designRequest.findFirst({
-    where: { id, ownerId: user.id },
-    include: {
-      comments: { include: { author: { select: { id: true, name: true, role: true } } }, orderBy: { createdAt: "asc" } },
-      event: { select: { id: true, title: true } },
-      deliveredTemplate: true,
-    },
-  });
+  const r = await designRequestDetail(id, user.id);
   if (!r) notFound();
   const expired = r.quoteValidUntil && r.quoteValidUntil < new Date();
   return (

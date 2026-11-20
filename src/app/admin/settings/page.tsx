@@ -1,4 +1,4 @@
-import { prisma } from "@/lib/db";
+import { allPlans } from "@/services/queries";
 import { getSettings } from "@/lib/settings";
 import { Flash, PageHeader, Badge, Money } from "@/components/ui";
 import { SubmitButton } from "@/components/client";
@@ -10,7 +10,7 @@ const sar = (h: number) => (h / 100).toString();
 
 export default async function AdminSettings({ searchParams }: { searchParams: Promise<Record<string, string>> }) {
   const sp = await searchParams;
-  const [plans, s] = await Promise.all([prisma.pricingPlan.findMany({ orderBy: { places: "asc" } }), getSettings()]);
+  const [plans, s] = await Promise.all([allPlans(), getSettings()]);
   return (
     <div className="stack">
       <Flash sp={sp} />

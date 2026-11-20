@@ -1,7 +1,8 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { requireUser } from "@/lib/auth";
-import { prisma } from "@/lib/db";
+import { C, getDoc } from "@/lib/firestore";
+import type { Event } from "@/lib/types";
 import { canWorkCheckIn } from "@/services/events";
 import { checkInSummary } from "@/services/checkin";
 import { formatDateTime } from "@/lib/format";
@@ -19,7 +20,7 @@ export default async function CheckinEventPage({ params }: { params: Promise<{ e
       </div>
     );
   }
-  const event = await prisma.event.findUnique({ where: { id: eventId } });
+  const event = await getDoc<Event>(C.events, eventId);
   if (!event) notFound();
   const summary = await checkInSummary(event.id);
 

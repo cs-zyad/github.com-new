@@ -1,12 +1,9 @@
 import { defineConfig } from "vitest/config";
 import path from "node:path";
-import os from "node:os";
 
-// قاعدة بيانات جديدة فارغة لكل تشغيل اختبارات (لا تمس قاعدة التطوير)
-const dbUrl =
-  process.env.TEST_DATABASE_URL ??
-  `file:${path.join(os.tmpdir(), `wafda-test-${process.pid}-${Date.now()}.db`)}?connection_limit=1`;
-process.env.WAFDA_TEST_DB_URL = dbUrl;
+// الاختبارات تعمل على محاكي Firestore الرسمي (لا تمس أي قاعدة حقيقية):
+//   npm test   ← يشغّل المحاكي ثم الاختبارات داخله
+const emulator = process.env.FIRESTORE_EMULATOR_HOST ?? "127.0.0.1:8085";
 
 export default defineConfig({
   resolve: { alias: { "@": path.resolve(import.meta.dirname, "src") } },
@@ -17,7 +14,8 @@ export default defineConfig({
     testTimeout: 60_000,
     hookTimeout: 60_000,
     env: {
-      DATABASE_URL: dbUrl,
+      FIRESTORE_EMULATOR_HOST: emulator,
+      FIREBASE_PROJECT_ID: "demo-wafda-test",
       APP_URL: "http://localhost:3000",
       DEMO_MODE: "true",
       WHATSAPP_PROVIDER: "mock",

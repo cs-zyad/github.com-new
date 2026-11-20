@@ -1,6 +1,6 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
-import { prisma } from "@/lib/db";
+import { invitationPage } from "@/services/queries";
 import { eventView } from "@/services/presentation";
 import { parsePalette } from "@/services/designs";
 import { rsvpClosedReason } from "@/services/rsvp";
@@ -18,10 +18,7 @@ export default async function InvitationPage({
   searchParams: Promise<Record<string, string>>;
 }) {
   const [{ token }, sp] = await Promise.all([params, searchParams]);
-  const inv = await prisma.invitation.findUnique({
-    where: { token },
-    include: { event: { include: { template: true } }, registration: true },
-  });
+  const inv = await invitationPage(token);
   if (!inv || inv.event.mode !== "PRIVATE") notFound();
   const event = inv.event;
   const view = eventView(event);

@@ -1,16 +1,20 @@
-import { prisma, type Db, type Tx } from "@/lib/db";
+import { C, ref, getDoc, keyId, runTx, txGet, type Transaction } from "@/lib/firestore";
 import { AppError } from "@/lib/errors";
 import { formatMoney } from "@/lib/format";
+import type { Wallet, WalletTransaction } from "@/lib/types";
 
-/** رصيد الرسائل: دفتر قيود (WalletTransaction) + رصيد مخزّن يُحدّث بعمليات ذرّية مشروطة */
+/** رصيد الرسائل: وثيقة رصيد لكل منظّم + دفتر قيود بمعرّفات ثابتة من مفتاح منع التكرار */
 
-export async function ensureWallet(userId: string, db: Db = prisma) {
-  return db.wallet.upsert({ where: { userId }, create: { userId }, update: {} });
+export async function ensureWallet(userId: string): Promise<Wallet> {
+  const w = await getDoc<Wallet>(C.wallets, userId);
+  if (w) return w;
+  const now = new Date();
+  await ref(C.wallets, userId).set({ userId, balance: 0, createdAt: now, updatedAt: now }, { merge: true });
+  return (await getDoc<Wallet>(C.wallets, userId))!;
 }
 
-export async function getBalance(userId: string, db: Db = prisma): Promise<number> {
-  const w = await db.wallet.findUnique({ where: { userId } });
-  return w?.balance ?? 0;
+export async function getBalance(userId: string): Promise<number> {
+  return (await getDoc<Wallet>(C.wallets, userId))?.balance ?? 0;
 }
 
 export class InsufficientBalanceError extends AppError {
@@ -28,73 +32,67 @@ export class InsufficientBalanceError extends AppError {
   }
 }
 
-/**
- * خصم ذرّي: ينجح فقط إذا كان الرصيد يكفي (UPDATE ... WHERE balance >= amount).
- * القيد محمي بمفتاح فريد فلا يتكرر الخصم عند إعادة المحاولة.
- */
-export async function debitWallet(
-  tx: Tx,
-  params: { userId: string; amount: number; description: string; idempotencyKey: string; batchId?: string },
-) {
-  if (params.amount <= 0) return null;
-  const existing = await tx.walletTransaction.findUnique({ where: { idempotencyKey: params.idempotencyKey } });
-  if (existing) return existing;
-  const wallet = await ensureWallet(params.userId, tx);
-  const res = await tx.wallet.updateMany({
-    where: { id: wallet.id, balance: { gte: params.amount } },
-    data: { balance: { decrement: params.amount } },
-  });
-  if (res.count === 0) {
-    const fresh = await tx.wallet.findUniqueOrThrow({ where: { id: wallet.id } });
-    throw new InsufficientBalanceError(params.amount, fresh.balance);
-  }
-  const after = await tx.wallet.findUniqueOrThrow({ where: { id: wallet.id } });
-  return tx.walletTransaction.create({
-    data: {
-      walletId: wallet.id,
-      type: "DEBIT",
-      amount: -params.amount,
-      balanceAfter: after.balance,
-      description: params.description,
-      batchId: params.batchId,
-      idempotencyKey: params.idempotencyKey,
-    },
-  });
+/** مرحلة القراءة: الرصيد وقيد مفتاح التكرار */
+export async function readWalletState(tx: Transaction, userId: string, idempotencyKey: string) {
+  const [wallet, entry] = await Promise.all([
+    txGet<Wallet>(tx, ref(C.wallets, userId)),
+    txGet<WalletTransaction>(tx, ref(C.walletTransactions, keyId(idempotencyKey))),
+  ]);
+  return { balance: wallet?.balance ?? 0, exists: !!wallet, entryExists: !!entry };
 }
 
-/** إضافة رصيد (شحن أو استرجاع) — محمية بمفتاح فريد */
-export async function creditWallet(
-  tx: Tx,
+/** مرحلة الكتابة: قيد + تحديث الرصيد (المبلغ موجب للإضافة وسالب للخصم) */
+export function writeWalletEntry(
+  tx: Transaction,
+  state: { balance: number; exists: boolean },
   params: {
     userId: string;
     amount: number;
-    type: "TOPUP" | "REFUND" | "ADJUSTMENT";
+    type: "TOPUP" | "DEBIT" | "REFUND" | "ADJUSTMENT";
     description: string;
     idempotencyKey: string;
     paymentId?: string;
+    batchId?: string;
     messageId?: string;
   },
 ) {
-  const existing = await tx.walletTransaction.findUnique({ where: { idempotencyKey: params.idempotencyKey } });
-  if (existing) return { tx: existing, applied: false };
-  const wallet = await ensureWallet(params.userId, tx);
-  // القيد أولًا: إذا تكرر المفتاح بالتزامن يفشل الإدراج وتُلغى المعاملة كاملة
-  const entry = await tx.walletTransaction.create({
-    data: {
-      walletId: wallet.id,
-      type: params.type,
-      amount: params.amount,
-      balanceAfter: 0,
-      description: params.description,
-      paymentId: params.paymentId,
-      messageId: params.messageId,
-      idempotencyKey: params.idempotencyKey,
-    },
+  const now = new Date();
+  const balanceAfter = state.balance + params.amount;
+  tx.set(
+    ref(C.wallets, params.userId),
+    state.exists ? { balance: balanceAfter, updatedAt: now } : { userId: params.userId, balance: balanceAfter, createdAt: now, updatedAt: now },
+    { merge: true },
+  );
+  tx.set(ref(C.walletTransactions, keyId(params.idempotencyKey)), {
+    userId: params.userId,
+    type: params.type,
+    amount: params.amount,
+    balanceAfter,
+    description: params.description,
+    paymentId: params.paymentId ?? null,
+    batchId: params.batchId ?? null,
+    messageId: params.messageId ?? null,
+    idempotencyKey: params.idempotencyKey,
+    createdAt: now,
   });
-  const updated = await tx.wallet.update({
-    where: { id: wallet.id },
-    data: { balance: { increment: params.amount } },
+  return balanceAfter;
+}
+
+/** إضافة رصيد (شحن/استرجاع/تسوية) بمعاملة مستقلة — مرة واحدة لكل مفتاح */
+export async function creditWallet(params: {
+  userId: string;
+  amount: number;
+  type: "TOPUP" | "REFUND" | "ADJUSTMENT";
+  description: string;
+  idempotencyKey: string;
+  paymentId?: string;
+  messageId?: string;
+}): Promise<{ applied: boolean }> {
+  return runTx(async (tx) => {
+    const st = await readWalletState(tx, params.userId, params.idempotencyKey);
+    if (st.entryExists) return { applied: false };
+    if (st.balance + params.amount < 0) throw new AppError("الرصيد لا يكفي للخصم");
+    writeWalletEntry(tx, st, params);
+    return { applied: true };
   });
-  const final = await tx.walletTransaction.update({ where: { id: entry.id }, data: { balanceAfter: updated.balance } });
-  return { tx: final, applied: true };
 }

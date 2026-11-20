@@ -1,6 +1,6 @@
 import Link from "next/link";
 import { requireUser } from "@/lib/auth";
-import { prisma } from "@/lib/db";
+import { ownerDesignRequests } from "@/services/queries";
 import { formatDateTime } from "@/lib/format";
 import { designStatusLabel } from "@/lib/labels";
 import { Flash, PageHeader, Badge, Empty, Money } from "@/components/ui";
@@ -10,7 +10,7 @@ export const metadata = { title: "طلبات التصميم" };
 export default async function DesignsPage({ searchParams }: { searchParams: Promise<Record<string, string>> }) {
   const sp = await searchParams;
   const user = await requireUser();
-  const list = await prisma.designRequest.findMany({ where: { ownerId: user.id }, orderBy: { updatedAt: "desc" } });
+  const list = await ownerDesignRequests(user.id);
   return (
     <div className="stack">
       <Flash sp={sp} />

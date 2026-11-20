@@ -1,5 +1,7 @@
 import { getCurrentUser } from "@/lib/auth";
-import { prisma } from "@/lib/db";
+import { C, getDoc } from "@/lib/firestore";
+import { exportRows } from "@/services/queries";
+import type { Event } from "@/lib/types";
 import { formatDateTime } from "@/lib/format";
 import { deliveryLabel, regStatusLabel, checkInMethodLabel } from "@/lib/labels";
 
@@ -14,17 +16,13 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
   const { id } = await params;
   const user = await getCurrentUser();
   if (!user) return new Response("Unauthorized", { status: 401 });
-  const event = await prisma.event.findFirst({ where: { id, ownerId: user.id } });
-  if (!event) return new Response("Not found", { status: 404 });
+  const event = await getDoc<Event>(C.events, id);
+  if (!event || event.ownerId !== user.id) return new Response("Not found", { status: 404 });
 
   const header = ["الاسم", "النوع", "الجوال", "البريد", "حالة الدعوة", "حالة التأكيد", "الحضور", "وقت الدخول", "طريقة التحضير", "سجّله"];
   const lines: string[][] = [];
 
-  const regs = await prisma.registration.findMany({
-    where: { eventId: event.id },
-    include: { tickets: { include: { checkedInBy: { select: { name: true } } } }, invitation: true },
-    orderBy: { createdAt: "asc" },
-  });
+  const { registrations: regs, pendingInvitations } = await exportRows(event.id);
   for (const r of regs) {
     const tickets = r.tickets.filter((t) => t.status === "ACTIVE");
     const base = [r.phone ?? "", r.email ?? "", r.invitation ? deliveryLabel[r.invitation.deliveryStatus] : "رابط عام", regStatusLabel[r.status]];
@@ -40,12 +38,12 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
         t.checkedInAt ? "حضر" : "لم يحضر",
         t.checkedInAt ? formatDateTime(t.checkedInAt, event.timezone) : "",
         t.checkInMethod ? checkInMethodLabel[t.checkInMethod] : "",
-        t.checkedInBy?.name ?? "",
+        t.checkedInByName ?? "",
       ]);
     }
   }
   if (event.mode === "PRIVATE") {
-    const pending = await prisma.invitation.findMany({ where: { eventId: event.id, registration: null }, orderBy: { createdAt: "asc" } });
+    const pending = pendingInvitations;
     for (const inv of pending) {
       lines.push([inv.name, "ضيف", inv.phone ?? "", inv.email ?? "", deliveryLabel[inv.deliveryStatus], "لم يؤكد", "", "", "", ""]);
     }

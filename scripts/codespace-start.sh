@@ -24,10 +24,17 @@ fi
 
 [ -d node_modules ] || npm install
 
-if [ ! -f prisma/dev.db ]; then
-  npx prisma db push --skip-generate
-  npx tsx prisma/seed.ts | tee /tmp/wafda-seed.txt
+# قاعدة البيانات: إن لم تُضبط بيانات Firebase في .env نستخدم محاكي Firestore المحلي
+if ! grep -qE '^FIREBASE_SERVICE_ACCOUNT=".+"' .env && [ -z "${FIREBASE_SERVICE_ACCOUNT:-}" ]; then
+  export FIRESTORE_EMULATOR_HOST="127.0.0.1:8085"
+  if ! curl -s "http://${FIRESTORE_EMULATOR_HOST}/" >/dev/null 2>&1; then
+    IMPORT=""; [ -d .emulator-data ] && IMPORT="--import=.emulator-data"
+    nohup npx -y firebase-tools@15.37.0 emulators:start --only firestore --project demo-wafda $IMPORT --export-on-exit=.emulator-data > /tmp/wafda-emulator.log 2>&1 &
+    for i in $(seq 1 90); do curl -s "http://${FIRESTORE_EMULATOR_HOST}/" >/dev/null 2>&1 && break; sleep 2; done
+  fi
 fi
+
+npx tsx scripts/seed.ts | tee /tmp/wafda-seed.txt
 
 npm run build > /tmp/wafda-build.log 2>&1
 

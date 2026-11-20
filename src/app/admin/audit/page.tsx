@@ -1,11 +1,11 @@
-import { prisma } from "@/lib/db";
+import { adminAudit } from "@/services/queries";
 import { formatDateTime } from "@/lib/format";
 import { PageHeader } from "@/components/ui";
 
 export const metadata = { title: "سجل التدقيق" };
 
 export default async function AdminAudit() {
-  const logs = await prisma.auditLog.findMany({ orderBy: { createdAt: "desc" }, take: 300, include: { actor: { select: { name: true } } } });
+  const logs = await adminAudit();
   return (
     <div className="stack">
       <PageHeader title="سجل التدقيق" subtitle="العمليات الإدارية والمهمة: الدفع، الإعدادات، الصلاحيات، الإلغاءات، التسويات." />

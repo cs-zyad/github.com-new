@@ -1,6 +1,6 @@
 import Link from "next/link";
 import { requireUser } from "@/lib/auth";
-import { prisma } from "@/lib/db";
+import { ownerSupportTickets, ownerEventOptions } from "@/services/queries";
 import { formatDateTime } from "@/lib/format";
 import { supportCategoryLabel, supportStatusLabel } from "@/lib/labels";
 import { Flash, PageHeader, Badge, Empty } from "@/components/ui";
@@ -13,8 +13,8 @@ export default async function SupportPage({ searchParams }: { searchParams: Prom
   const sp = await searchParams;
   const user = await requireUser();
   const [tickets, events] = await Promise.all([
-    prisma.supportTicket.findMany({ where: { ownerId: user.id }, orderBy: { updatedAt: "desc" } }),
-    prisma.event.findMany({ where: { ownerId: user.id }, orderBy: { startsAt: "desc" }, select: { id: true, title: true } }),
+    ownerSupportTickets(user.id),
+    ownerEventOptions(user.id),
   ]);
   return (
     <div className="stack">

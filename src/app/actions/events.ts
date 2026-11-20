@@ -148,10 +148,9 @@ export async function resendTicketAction(fd: FormData) {
   await act(`/dashboard/events/${id}/guests`, async () => {
     const user = await assertUser();
     await getOwnedEvent(id, user.id);
-    const reg = await import("@/lib/db").then(({ prisma }) =>
-      prisma.registration.findFirst({ where: { id: str(fd, "registrationId"), eventId: id } }),
-    );
-    if (!reg) throw new AppError("التسجيل غير موجود");
+    const { C, getDoc } = await import("@/lib/firestore");
+    const reg = await getDoc<{ id: string; eventId: string }>(C.registrations, str(fd, "registrationId"));
+    if (!reg || reg.eventId !== id) throw new AppError("التسجيل غير موجود");
     const ok = await resendTicket(reg.id);
     const { kickOutbox } = await import("@/services/messaging");
     await kickOutbox();

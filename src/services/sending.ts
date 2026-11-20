@@ -1,8 +1,8 @@
-import type { Event, Invitation } from "@prisma/client";
-import { prisma, withTx, isUniqueViolation, type Tx } from "@/lib/db";
+import { C, col, ref, getDoc, getDocs, getMany, newId, runTx, txGet } from "@/lib/firestore";
+import type { Event, Invitation, Registration, ScheduledJob } from "@/lib/types";
 import { AppError, NotFoundError } from "@/lib/errors";
 import { getSettings, type OperatingSettings } from "@/lib/settings";
-import { audit } from "@/lib/audit";
+import { audit, auditTx } from "@/lib/audit";
 import { availableSeats, getOwnedEvent, requiredPrivatePlaces } from "./events";
 import { channelsOf } from "./invitations";
 import { composeInvitation, composeWaitlistOffer } from "./compose";
@@ -10,16 +10,6 @@ import { enqueueWalletBatch, estimateCost, kickOutbox, type OutgoingItem } from 
 import { InsufficientBalanceError, getBalance } from "./wallet";
 
 export type SendTarget = "NOT_SENT" | "FAILED" | "SELECTED";
-
-/** نقرتان متزامنتان بنفس مفتاح الدفعة: الثانية تعيد الدفعة الأولى بدل الخطأ */
-async function withBatchTx<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
-  try {
-    return await withTx(fn);
-  } catch (e) {
-    if (isUniqueViolation(e)) return withTx(fn);
-    throw e;
-  }
-}
 
 function buildInviteItems(event: Event, invs: Invitation[], kind: "INVITATION" | "REMINDER"): OutgoingItem[] {
   const items: OutgoingItem[] = [];
@@ -52,15 +42,14 @@ async function assertCanSendInvitations(event: Event) {
   }
 }
 
+const byCreated = (a: { createdAt: Date }, b: { createdAt: Date }) => a.createdAt.getTime() - b.createdAt.getTime();
+
 async function invitationsForTarget(eventId: string, target: SendTarget, ids?: string[]) {
   if (target === "SELECTED") {
     if (!ids?.length) throw new AppError("اختر مدعوًا واحدًا على الأقل");
-    return prisma.invitation.findMany({ where: { eventId, id: { in: ids } }, orderBy: { createdAt: "asc" } });
+    return (await getMany<Invitation>(C.invitations, ids)).filter((i) => i.eventId === eventId).sort(byCreated);
   }
-  return prisma.invitation.findMany({
-    where: { eventId, deliveryStatus: target },
-    orderBy: { createdAt: "asc" },
-  });
+  return (await getDocs<Invitation>(col(C.invitations).where("eventId", "==", eventId).where("deliveryStatus", "==", target))).sort(byCreated);
 }
 
 export async function previewInvitationSend(ownerId: string, eventId: string, target: SendTarget, ids?: string[]) {
@@ -84,17 +73,15 @@ export async function sendInvitations(
   const invs = await invitationsForTarget(event.id, params.target, params.invitationIds);
   if (invs.length === 0) throw new AppError("لا يوجد مدعوون للإرسال في هذا الاختيار");
   const items = buildInviteItems(event, invs, "INVITATION");
-  const result = await withBatchTx((tx) =>
-    enqueueWalletBatch(tx, {
-      ownerId,
-      eventId: event.id,
-      kind: "INVITATION",
-      batchKey: `inv:${event.id}:${params.batchKey}`,
-      items,
-      settings,
-    }),
-  );
-  await audit(prisma, {
+  const result = await enqueueWalletBatch({
+    ownerId,
+    eventId: event.id,
+    kind: "INVITATION",
+    batchKey: `inv:${event.id}:${params.batchKey}`,
+    items,
+    settings,
+  });
+  await audit({
     actorId: ownerId,
     action: "invitation.send",
     entityType: "Event",
@@ -109,10 +96,11 @@ export async function sendInvitations(
 
 /** من يحتاج تذكيرًا الآن: وصلته الدعوة ولم يرد بعد (لا تأكيد ولا اعتذار ولا انتظار) */
 export async function reminderRecipients(eventId: string) {
-  return prisma.invitation.findMany({
-    where: { eventId, deliveryStatus: "SENT", registration: null },
-    orderBy: { createdAt: "asc" },
-  });
+  return (
+    await getDocs<Invitation>(
+      col(C.invitations).where("eventId", "==", eventId).where("deliveryStatus", "==", "SENT").where("regStatus", "==", null),
+    )
+  ).sort(byCreated);
 }
 
 export async function previewReminder(ownerId: string, eventId: string) {
@@ -136,18 +124,16 @@ async function runReminder(
   const invs = await reminderRecipients(event.id);
   if (invs.length === 0) return { recipients: 0, queued: 0, skipped: 0, totalCost: 0, duplicate: false, batchId: null };
   const items = buildInviteItems(event, invs, "REMINDER");
-  const r = await withBatchTx((tx) =>
-    enqueueWalletBatch(tx, {
-      ownerId,
-      eventId: event.id,
-      kind: "REMINDER",
-      batchKey,
-      items,
-      trigger,
-      scheduledJobId,
-      settings,
-    }),
-  );
+  const r = await enqueueWalletBatch({
+    ownerId,
+    eventId: event.id,
+    kind: "REMINDER",
+    batchKey,
+    items,
+    trigger,
+    scheduledJobId,
+    settings,
+  });
   return { recipients: invs.length, ...r };
 }
 
@@ -167,43 +153,58 @@ export async function scheduleReminder(ownerId: string, eventId: string, runAt: 
   if (runAt.getTime() < Date.now() + 60_000) throw new AppError("اختر وقتًا في المستقبل");
   if (runAt > event.startsAt) throw new AppError("موعد التذكير يجب أن يكون قبل بداية الفعالية");
   const preview = await previewReminder(ownerId, eventId);
-  const job = await prisma.scheduledJob.create({
-    data: { type: "REMINDER", ownerId, eventId: event.id, runAt, estimatedCost: preview.total },
-  });
-  await audit(prisma, { actorId: ownerId, action: "reminder.schedule", entityType: "ScheduledJob", entityId: job.id });
+  const job: ScheduledJob = {
+    id: newId(),
+    type: "REMINDER",
+    ownerId,
+    eventId: event.id,
+    runAt,
+    status: "PENDING",
+    payload: "{}",
+    result: null,
+    estimatedCost: preview.total,
+    startedAt: null,
+    finishedAt: null,
+    createdAt: new Date(),
+  };
+  const { id: jobId, ...jobData } = job;
+  await ref(C.scheduledJobs, jobId).set(jobData);
+  await audit({ actorId: ownerId, action: "reminder.schedule", entityType: "ScheduledJob", entityId: job.id });
   return { job, preview };
 }
 
 export async function cancelScheduledReminder(ownerId: string, jobId: string) {
-  const res = await prisma.scheduledJob.updateMany({
-    where: { id: jobId, ownerId, status: "PENDING" },
-    data: { status: "CANCELLED", finishedAt: new Date() },
+  const ok = await runTx(async (tx) => {
+    const job = await txGet<ScheduledJob>(tx, ref(C.scheduledJobs, jobId));
+    if (!job || job.ownerId !== ownerId || job.status !== "PENDING") return false;
+    tx.update(ref(C.scheduledJobs, jobId), { status: "CANCELLED", finishedAt: new Date() });
+    return true;
   });
-  if (res.count === 0) throw new NotFoundError("التذكير غير موجود أو نُفّذ مسبقًا");
+  if (!ok) throw new NotFoundError("التذكير غير موجود أو نُفّذ مسبقًا");
 }
 
 /** تنفيذ المهام المستحقة — كل مهمة تُحجز بتحديث شرطي فلا تُنفّذ مرتين */
 export async function runDueJobs() {
   const settings = await getSettings();
-  const due = await prisma.scheduledJob.findMany({
-    where: { status: "PENDING", runAt: { lte: new Date() } },
-    take: 20,
-    orderBy: { runAt: "asc" },
-  });
+  const now = Date.now();
+  const due = (await getDocs<ScheduledJob>(col(C.scheduledJobs).where("status", "==", "PENDING")))
+    .filter((j) => j.runAt.getTime() <= now)
+    .sort((a, b) => a.runAt.getTime() - b.runAt.getTime())
+    .slice(0, 20);
   let done = 0;
   for (const job of due) {
-    const claimed = await prisma.scheduledJob.updateMany({
-      where: { id: job.id, status: "PENDING" },
-      data: { status: "RUNNING", startedAt: new Date() },
+    // حجز المهمة بمعاملة: لا تُنفّذ مرتين حتى مع عاملين متوازيين
+    const claimed = await runTx(async (tx) => {
+      const cur = await txGet<ScheduledJob>(tx, ref(C.scheduledJobs, job.id));
+      if (!cur || cur.status !== "PENDING") return false;
+      tx.update(ref(C.scheduledJobs, job.id), { status: "RUNNING", startedAt: new Date() });
+      return true;
     });
-    if (claimed.count === 0) continue;
+    if (!claimed) continue;
     const finish = (status: string, result: unknown) =>
-      prisma.scheduledJob.update({
-        where: { id: job.id },
-        data: { status, result: JSON.stringify(result), finishedAt: new Date() },
-      });
+      ref(C.scheduledJobs, job.id).update({ status, result: JSON.stringify(result), finishedAt: new Date() });
     try {
-      const event = await prisma.event.findUnique({ where: { id: job.eventId } });
+      const event = await getDoc<Event>(C.events, job.eventId);
       if (!event || event.status !== "ACTIVE") {
         await finish("CANCELLED", { reason: "الفعالية غير نشطة" });
         continue;
@@ -227,13 +228,10 @@ export async function runDueJobs() {
 // ───────── قائمة الانتظار ─────────
 
 export async function offerWaitlistSpot(ownerId: string, registrationId: string, batchKey: string) {
-  const reg = await prisma.registration.findFirst({
-    where: { id: registrationId, event: { ownerId } },
-    include: { event: true },
-  });
-  if (!reg) throw new NotFoundError("التسجيل غير موجود");
+  const reg = await getDoc<Registration>(C.registrations, registrationId);
+  const event = reg ? await getDoc<Event>(C.events, reg.eventId) : null;
+  if (!reg || !event || event.ownerId !== ownerId) throw new NotFoundError("التسجيل غير موجود");
   if (reg.status !== "WAITLISTED") throw new AppError("هذا الشخص ليس في قائمة الانتظار");
-  const event = reg.event;
   if (event.status !== "ACTIVE") throw new AppError("الفعالية غير نشطة");
   const free = availableSeats(event);
   if (free < 1) throw new AppError("لا توجد مقاعد متاحة حاليًا. يتوفر مقعد عند اعتذار ضيف أو زيادة السعة.");
@@ -242,32 +240,34 @@ export async function offerWaitlistSpot(ownerId: string, registrationId: string,
   if (!recipient) throw new AppError("لا توجد وسيلة تواصل لهذا الشخص");
   const expires = new Date(Date.now() + settings.waitlistOfferHours * 3600 * 1000);
 
-  const result = await withTx(async (tx) => {
-    const res = await tx.registration.updateMany({
-      where: { id: reg.id, status: "WAITLISTED" },
-      data: { status: "OFFERED", offeredAt: new Date(), offerExpiresAt: expires },
-    });
-    if (res.count !== 1) throw new AppError("تغيّرت حالة هذا الشخص للتو. حدّث الصفحة.");
-    const msg = composeWaitlistOffer(event, { ...reg, offerExpiresAt: expires }, settings.waitlistOfferHours);
-    const r = await enqueueWalletBatch(tx, {
-      ownerId,
-      eventId: event.id,
-      kind: "WAITLIST_OFFER",
-      batchKey: `offer:${reg.id}:${batchKey}`,
-      items: [
-        {
-          key: reg.id,
-          channel: reg.contactMethod as "WHATSAPP" | "EMAIL",
-          recipient,
-          subject: msg.subject,
-          body: msg.body,
-          registrationId: reg.id,
-        },
-      ],
-      settings,
-    });
-    await audit(tx, { actorId: ownerId, action: "waitlist.offer", entityType: "Registration", entityId: reg.id });
-    return r;
+  const msg = composeWaitlistOffer(event, { ...reg, offerExpiresAt: expires }, settings.waitlistOfferHours);
+  // تحويل الحالة إلى «أُرسلت له فرصة» والخصم في نفس المعاملة: إن لم يكفِ الرصيد لا تتغير الحالة
+  const result = await enqueueWalletBatch({
+    ownerId,
+    eventId: event.id,
+    kind: "WAITLIST_OFFER",
+    batchKey: `offer:${reg.id}:${batchKey}`,
+    items: [
+      {
+        key: reg.id,
+        channel: reg.contactMethod as "WHATSAPP" | "EMAIL",
+        recipient,
+        subject: msg.subject,
+        body: msg.body,
+        registrationId: reg.id,
+      },
+    ],
+    settings,
+    extra: async (tx) => {
+      const cur = await txGet<Registration>(tx, ref(C.registrations, reg.id));
+      return () => {
+        if (!cur || cur.status !== "WAITLISTED") throw new AppError("تغيّرت حالة هذا الشخص للتو. حدّث الصفحة.");
+        const now = new Date();
+        tx.update(ref(C.registrations, reg.id), { status: "OFFERED", offeredAt: now, offerExpiresAt: expires, version: cur.version + 1, updatedAt: now });
+        if (cur.invitationId) tx.update(ref(C.invitations, cur.invitationId), { regStatus: "OFFERED", updatedAt: now });
+        auditTx(tx, { actorId: ownerId, action: "waitlist.offer", entityType: "Registration", entityId: reg.id });
+      };
+    },
   });
   await kickOutbox();
   return { ...result, free, expires };

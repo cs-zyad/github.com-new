@@ -1,7 +1,8 @@
-import { prisma, withTx } from "@/lib/db";
+import { C, col, ref, getDoc, getDocs, getFirst, newId, runTx, txGet, count, byDate } from "@/lib/firestore";
 import { AppError } from "@/lib/errors";
-import { phoneSearchFragment, normalizeEmail } from "@/lib/contact";
+import { phoneSearchFragment, normalizeEmail, toLatinDigits } from "@/lib/contact";
 import { assertCheckInAccess } from "./events";
+import type { Event, Registration, Ticket, User } from "@/lib/types";
 
 export type CheckInResult =
   | {
@@ -27,7 +28,7 @@ export function extractTicketCode(raw: string): string | null {
 
 /**
  * مسار تسجيل الحضور الوحيد — يستخدمه المسح والتسجيل اليدوي.
- * التحديث الشرطي (checkedInAt IS NULL) يضمن عدم تكرار الحضور حتى مع مسحين متزامنين.
+ * معاملة على وثيقة التذكرة: مسحان متزامنان لا يسجلان الحضور مرتين (الثاني يرى «حضر مسبقًا»).
  */
 export async function checkIn(params: {
   staffUserId: string;
@@ -37,53 +38,74 @@ export async function checkIn(params: {
   ticketId?: string;
 }): Promise<CheckInResult> {
   await assertCheckInAccess(params.staffUserId, params.eventId);
+  const staff = await getDoc<User>(C.users, params.staffUserId);
 
-  return withTx(async (tx) => {
-    const event = await tx.event.findUnique({ where: { id: params.eventId } });
+  const target = params.ticketId
+    ? await getDoc<Ticket>(C.tickets, params.ticketId)
+    : params.code
+      ? await getFirst<Ticket>(col(C.tickets).where("code", "==", params.code))
+      : null;
+
+  return runTx(async (tx): Promise<CheckInResult> => {
+    const event = await txGet<Event>(tx, ref(C.events, params.eventId));
+    const ticket = target ? await txGet<Ticket>(tx, ref(C.tickets, target.id)) : null;
+    const reg = ticket ? await txGet<Registration>(tx, ref(C.registrations, ticket.registrationId)) : null;
     if (!event || event.status !== "ACTIVE") throw new AppError("الفعالية غير نشطة");
 
-    const ticket = params.ticketId
-      ? await tx.ticket.findUnique({ where: { id: params.ticketId }, include: { registration: true } })
-      : params.code
-        ? await tx.ticket.findUnique({ where: { code: params.code }, include: { registration: true } })
-        : null;
-
     const log = (result: string, ticketId?: string) =>
-      tx.checkInLog.create({
-        data: { eventId: params.eventId, ticketId: ticketId ?? null, staffId: params.staffUserId, method: params.method, result },
+      tx.set(ref(C.checkInLogs, newId()), {
+        eventId: params.eventId,
+        ticketId: ticketId ?? null,
+        staffId: params.staffUserId,
+        method: params.method,
+        result,
+        createdAt: new Date(),
       });
 
-    if (!ticket) {
-      await log("INVALID");
-      return { result: "INVALID", message: "رمز غير صالح" } as const;
+    if (!ticket || !reg) {
+      log("INVALID");
+      return { result: "INVALID", message: "رمز غير صالح" };
     }
     if (ticket.eventId !== params.eventId) {
       // لا نكشف بيانات تذكرة تابعة لفعالية أخرى
-      await log("WRONG_EVENT");
-      return { result: "WRONG_EVENT", message: "التذكرة لا تخص هذه الفعالية" } as const;
+      log("WRONG_EVENT");
+      return { result: "WRONG_EVENT", message: "التذكرة لا تخص هذه الفعالية" };
     }
-    if (ticket.status !== "ACTIVE" || ticket.registration.status !== "CONFIRMED") {
-      await log("CANCELLED", ticket.id);
-      return { result: "CANCELLED", message: "التذكرة ملغاة (اعتذر صاحبها أو أُلغي تسجيله)" } as const;
+    if (ticket.status !== "ACTIVE" || reg.status !== "CONFIRMED") {
+      log("CANCELLED", ticket.id);
+      return { result: "CANCELLED", message: "التذكرة ملغاة (اعتذر صاحبها أو أُلغي تسجيله)" };
     }
-
+    if (ticket.checkedIn && ticket.checkedInAt) {
+      log("ALREADY", ticket.id);
+      return {
+        result: "ALREADY",
+        ticketId: ticket.id,
+        holderName: ticket.holderName,
+        kind: ticket.kind,
+        primaryName: reg.name,
+        checkedInAt: ticket.checkedInAt,
+        method: ticket.checkInMethod ?? params.method,
+      };
+    }
     const now = new Date();
-    const updated = await tx.ticket.updateMany({
-      where: { id: ticket.id, checkedInAt: null, status: "ACTIVE" },
-      data: { checkedInAt: now, checkedInById: params.staffUserId, checkInMethod: params.method },
+    tx.update(ref(C.tickets, ticket.id), {
+      checkedIn: true,
+      checkedInAt: now,
+      checkedInById: params.staffUserId,
+      checkedInByName: staff?.name ?? null,
+      checkInMethod: params.method,
+      updatedAt: now,
     });
-    const fresh = await tx.ticket.findUniqueOrThrow({ where: { id: ticket.id } });
-    const result = updated.count === 1 ? "SUCCESS" : "ALREADY";
-    await log(result, ticket.id);
+    log("SUCCESS", ticket.id);
     return {
-      result,
+      result: "SUCCESS",
       ticketId: ticket.id,
-      holderName: fresh.holderName,
-      kind: fresh.kind,
-      primaryName: ticket.registration.name,
-      checkedInAt: fresh.checkedInAt!,
-      method: fresh.checkInMethod ?? params.method,
-    } as const;
+      holderName: ticket.holderName,
+      kind: ticket.kind,
+      primaryName: reg.name,
+      checkedInAt: now,
+      method: params.method,
+    };
   });
 }
 
@@ -94,44 +116,55 @@ export async function searchTickets(staffUserId: string, eventId: string, query:
   if (q.length < 2) return [];
   const phoneFrag = phoneSearchFragment(q);
   const email = normalizeEmail(q);
-  const regOr: object[] = [{ name: { contains: q } }];
-  if (phoneFrag) regOr.push({ phone: { contains: phoneFrag } });
-  if (email) regOr.push({ email });
-  else if (q.includes("@")) regOr.push({ email: { contains: q.toLowerCase() } });
+  const lower = toLatinDigits(q).toLowerCase();
 
-  const tickets = await prisma.ticket.findMany({
-    where: {
-      eventId,
-      status: "ACTIVE",
-      registration: { status: "CONFIRMED", OR: regOr },
-    },
-    include: { registration: { select: { name: true, phone: true, email: true } }, checkedInBy: { select: { name: true } } },
-    orderBy: [{ registrationId: "asc" }, { kind: "desc" }],
-    take: 30,
-  });
-  return tickets.map((t) => ({
-    ticketId: t.id,
-    kind: t.kind,
-    holderName: t.holderName,
-    primaryName: t.registration.name,
-    phone: t.registration.phone,
-    email: t.registration.email,
-    checkedInAt: t.checkedInAt,
-    checkInMethod: t.checkInMethod,
-    checkedInBy: t.checkedInBy?.name ?? null,
-  }));
+  const [regs, tickets] = await Promise.all([
+    getDocs<Registration>(col(C.registrations).where("eventId", "==", eventId).where("status", "==", "CONFIRMED")),
+    getDocs<Ticket>(col(C.tickets).where("eventId", "==", eventId).where("status", "==", "ACTIVE")),
+  ]);
+  const matched = new Map(
+    regs
+      .filter(
+        (r) =>
+          r.name.includes(q) ||
+          r.name.toLowerCase().includes(lower) ||
+          (phoneFrag && r.phone?.includes(phoneFrag)) ||
+          (email && r.email === email) ||
+          (q.includes("@") && r.email?.includes(lower)),
+      )
+      .map((r) => [r.id, r]),
+  );
+  return tickets
+    .filter((t) => matched.has(t.registrationId))
+    .sort((a, b) => a.registrationId.localeCompare(b.registrationId) || (a.kind === "PRIMARY" ? -1 : 1))
+    .slice(0, 30)
+    .map((t) => {
+      const r = matched.get(t.registrationId)!;
+      return {
+        ticketId: t.id,
+        kind: t.kind,
+        holderName: t.holderName,
+        primaryName: r.name,
+        phone: r.phone,
+        email: r.email,
+        checkedInAt: t.checkedInAt,
+        checkInMethod: t.checkInMethod,
+        checkedInBy: t.checkedInByName,
+      };
+    });
 }
 
 export async function checkInSummary(eventId: string) {
-  const [attended, totalTickets, recent] = await Promise.all([
-    prisma.ticket.count({ where: { eventId, status: "ACTIVE", checkedInAt: { not: null } } }),
-    prisma.ticket.count({ where: { eventId, status: "ACTIVE" } }),
-    prisma.ticket.findMany({
-      where: { eventId, checkedInAt: { not: null } },
-      orderBy: { checkedInAt: "desc" },
-      take: 8,
-      include: { registration: { select: { name: true } }, checkedInBy: { select: { name: true } } },
-    }),
-  ]);
-  return { attended, totalTickets, recent };
+  const active = col(C.tickets).where("eventId", "==", eventId).where("status", "==", "ACTIVE");
+  const [attended, totalTickets] = await Promise.all([count(active.where("checkedIn", "==", true)), count(active)]);
+  return { attended, totalTickets };
+}
+
+/** آخر من حضر (مع اسم صاحب الدعوة) */
+export async function recentCheckIns(eventId: string, take = 6) {
+  const tickets = (await getDocs<Ticket>(col(C.tickets).where("eventId", "==", eventId).where("checkedIn", "==", true)))
+    .sort(byDate<Ticket>("checkedInAt"))
+    .slice(0, take);
+  const regs = await Promise.all(tickets.map((t) => getDoc<Registration>(C.registrations, t.registrationId)));
+  return tickets.map((t, i) => ({ ...t, primaryName: regs[i]?.name ?? "" }));
 }

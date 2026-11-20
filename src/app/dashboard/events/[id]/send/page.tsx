@@ -1,6 +1,6 @@
 import Link from "next/link";
 import { requireUser } from "@/lib/auth";
-import { prisma } from "@/lib/db";
+import { eventJobs, eventBatches } from "@/services/queries";
 import { randomToken } from "@/lib/ids";
 import { getOwnedEvent, requiredPrivatePlaces } from "@/services/events";
 import { previewInvitationSend, previewReminder } from "@/services/sending";
@@ -29,13 +29,8 @@ export default async function SendPage({
     previewReminder(user.id, event.id),
     requiredPrivatePlaces(event.id),
     getSettings(),
-    prisma.scheduledJob.findMany({ where: { eventId: event.id }, orderBy: { runAt: "desc" }, take: 10 }),
-    prisma.messageBatch.findMany({
-      where: { eventId: event.id },
-      orderBy: { createdAt: "desc" },
-      take: 10,
-      include: { messages: { select: { status: true } } },
-    }),
+    eventJobs(event.id),
+    eventBatches(event.id),
   ]);
   const active = event.status === "ACTIVE";
   const coverageOk = required <= event.paidPlaces;

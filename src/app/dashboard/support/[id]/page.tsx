@@ -1,6 +1,6 @@
 import { notFound } from "next/navigation";
 import { requireUser } from "@/lib/auth";
-import { prisma } from "@/lib/db";
+import { supportTicketDetail } from "@/services/queries";
 import { formatDateTime } from "@/lib/format";
 import { supportCategoryLabel, supportStatusLabel } from "@/lib/labels";
 import { Flash, PageHeader, Badge } from "@/components/ui";
@@ -16,13 +16,7 @@ export default async function SupportDetail({
 }) {
   const [{ id }, sp] = await Promise.all([params, searchParams]);
   const user = await requireUser();
-  const t = await prisma.supportTicket.findFirst({
-    where: { id, ownerId: user.id },
-    include: {
-      comments: { include: { author: { select: { id: true, name: true, role: true } } }, orderBy: { createdAt: "asc" } },
-      event: { select: { title: true } },
-    },
-  });
+  const t = await supportTicketDetail(id, user.id);
   if (!t) notFound();
   return (
     <div className="stack">

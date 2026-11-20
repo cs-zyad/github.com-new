@@ -1,6 +1,6 @@
 import Link from "next/link";
 import { requireUser } from "@/lib/auth";
-import { prisma } from "@/lib/db";
+import { eventPayments, invitationCounts } from "@/services/queries";
 import { getOwnedEvent, requiredPlaces } from "@/services/events";
 import { quotePackage } from "@/services/pricing";
 import { links } from "@/services/presentation";
@@ -24,7 +24,7 @@ export default async function BillingPage({
   const settings = await getSettings();
   const [needed, payments] = await Promise.all([
     requiredPlaces(event),
-    prisma.payment.findMany({ where: { eventId: event.id }, orderBy: { createdAt: "desc" } }),
+    eventPayments(event.id),
   ]);
   let quote: Awaited<ReturnType<typeof quotePackage>> | null = null;
   let quoteError: string | null = null;
@@ -34,8 +34,9 @@ export default async function BillingPage({
     quoteError = e instanceof Error ? e.message : "تعذّر حساب الباقة";
   }
   const isPrivate = event.mode === "PRIVATE";
-  const withCompanion = isPrivate ? await prisma.invitation.count({ where: { eventId: event.id, allowCompanion: true } }) : 0;
-  const invitations = isPrivate ? await prisma.invitation.count({ where: { eventId: event.id } }) : 0;
+  const counts = isPrivate ? await invitationCounts(event.id) : { total: 0, withCompanion: 0 };
+  const withCompanion = counts.withCompanion;
+  const invitations = counts.total;
   const blocked = !event.templateId ? "اختر القالب وراجع المعاينة أولًا" : isPrivate && invitations === 0 ? "أضف المدعوين أولًا" : null;
 
   return (

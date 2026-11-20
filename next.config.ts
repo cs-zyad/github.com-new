@@ -16,7 +16,7 @@ function allowedOrigins(): string[] {
 }
 
 const nextConfig: NextConfig = {
-  serverExternalPackages: ["@prisma/client", "exceljs", "qrcode"],
+  serverExternalPackages: ["firebase-admin", "exceljs", "qrcode"],
   poweredByHeader: false,
   allowedDevOrigins: allowedOrigins(),
   experimental: {

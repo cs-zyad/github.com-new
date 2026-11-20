@@ -1,4 +1,4 @@
-import { prisma } from "@/lib/db";
+import { adminPayments } from "@/services/queries";
 import { formatDateTime } from "@/lib/format";
 import { paymentPurposeLabel, paymentStatusLabel } from "@/lib/labels";
 import { PageHeader, Badge, Money } from "@/components/ui";
@@ -6,10 +6,7 @@ import { PageHeader, Badge, Money } from "@/components/ui";
 export const metadata = { title: "المدفوعات" };
 
 export default async function AdminPayments() {
-  const [payments, events] = await Promise.all([
-    prisma.payment.findMany({ orderBy: { createdAt: "desc" }, take: 200, include: { owner: { select: { name: true } }, event: { select: { title: true } } } }),
-    prisma.paymentEvent.findMany({ orderBy: { receivedAt: "desc" }, take: 50 }),
-  ]);
+  const { payments, events } = await adminPayments();
   return (
     <div className="stack">
       <PageHeader title="المدفوعات" subtitle="العمليات وإشعارات المزوّد. كل إشعار يُعالج مرة واحدة حسب معرّفه." />

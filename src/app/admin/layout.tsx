@@ -1,12 +1,10 @@
 import { requireAdmin } from "@/lib/auth";
 import { AppShell } from "@/components/Shell";
-import { ensureDbReady } from "@/lib/db";
 
 export const metadata = { title: { default: "لوحة الأدمن", template: "%s | أدمن وفدة" } };
 
 export default async function AdminLayout({ children }: { children: React.ReactNode }) {
   const user = await requireAdmin();
-  await ensureDbReady();
   return (
     <AppShell
       user={user}

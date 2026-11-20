@@ -1,12 +1,10 @@
 import { redirect } from "next/navigation";
 import { requireUser } from "@/lib/auth";
 import { AppShell } from "@/components/Shell";
-import { ensureDbReady } from "@/lib/db";
 
 export default async function DashboardLayout({ children }: { children: React.ReactNode }) {
   const user = await requireUser();
   if (user.role === "ADMIN") redirect("/admin");
-  await ensureDbReady();
   return (
     <AppShell
       user={user}

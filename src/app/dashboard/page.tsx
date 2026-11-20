@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { prisma } from "@/lib/db";
+import { ownerEvents, staffAssignmentCount } from "@/services/queries";
 import { requireUser } from "@/lib/auth";
 import { getBalance } from "@/services/wallet";
 import { seatLimit } from "@/services/events";
@@ -13,13 +13,9 @@ export default async function DashboardHome({ searchParams }: { searchParams: Pr
   const sp = await searchParams;
   const user = await requireUser();
   const [events, balance, staffEvents] = await Promise.all([
-    prisma.event.findMany({
-      where: { ownerId: user.id },
-      orderBy: [{ startsAt: "asc" }],
-      include: { _count: { select: { invitations: true, registrations: { where: { status: "CONFIRMED" } } } } },
-    }),
+    ownerEvents(user.id),
     getBalance(user.id),
-    prisma.eventStaff.count({ where: { userId: user.id } }),
+    staffAssignmentCount(user.id),
   ]);
   const now = Date.now();
   const drafts = events.filter((e) => e.status === "DRAFT");
@@ -42,7 +38,7 @@ export default async function DashboardHome({ searchParams }: { searchParams: Pr
             </span>
             {e.mode === "PRIVATE" ? (
               <span>
-                الدعوات <bdi className="ltr">{e._count.invitations}</bdi>
+                الدعوات <bdi className="ltr">{e.invitationCount}</bdi>
               </span>
             ) : null}
           </div>

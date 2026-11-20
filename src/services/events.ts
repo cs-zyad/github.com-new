@@ -1,30 +1,33 @@
 import { z } from "zod";
-import { prisma, type Db } from "@/lib/db";
+import { C, col, ref, getDoc, getDocs, count, newId, db, uniqueRef as uniqueRefFor } from "@/lib/firestore";
 import { AppError, NotFoundError, ForbiddenError } from "@/lib/errors";
 import { localInputToDate, DEFAULT_TZ } from "@/lib/format";
 import { audit } from "@/lib/audit";
-import type { Event } from "@prisma/client";
+import type { Event, ScheduledJob } from "@/lib/types";
 
 // ───────── الصلاحيات وعزل البيانات ─────────
 
 /** يعيد الفعالية فقط إذا كان المستخدم مالكها — وإلا "غير موجودة" (لا نكشف وجودها) */
-export async function getOwnedEvent(eventId: string, userId: string, db: Db = prisma): Promise<Event> {
-  const event = await db.event.findFirst({ where: { id: eventId, ownerId: userId } });
-  if (!event) throw new NotFoundError("الفعالية غير موجودة");
+export async function getOwnedEvent(eventId: string, userId: string): Promise<Event> {
+  const event = await getDoc<Event>(C.events, eventId);
+  if (!event || event.ownerId !== userId) throw new NotFoundError("الفعالية غير موجودة");
   return event;
 }
 
+export const staffDocId = (eventId: string, userId: string) => `${eventId}_${userId}`;
+
 /** هل يستطيع المستخدم العمل على استقبال هذه الفعالية؟ (المالك أو عضو فريق معيّن) */
-export async function canWorkCheckIn(userId: string, eventId: string, db: Db = prisma): Promise<boolean> {
-  const event = await db.event.findUnique({ where: { id: eventId }, select: { ownerId: true } });
+export async function canWorkCheckIn(userId: string, eventId: string): Promise<boolean> {
+  if (!eventId) return false;
+  const event = await getDoc<Event>(C.events, eventId);
   if (!event) return false;
   if (event.ownerId === userId) return true;
-  const staff = await db.eventStaff.findUnique({ where: { eventId_userId: { eventId, userId } } });
-  return !!staff;
+  const staff = await ref(C.eventStaff, staffDocId(eventId, userId)).get();
+  return staff.exists;
 }
 
-export async function assertCheckInAccess(userId: string, eventId: string, db: Db = prisma) {
-  if (!(await canWorkCheckIn(userId, eventId, db))) {
+export async function assertCheckInAccess(userId: string, eventId: string) {
+  if (!(await canWorkCheckIn(userId, eventId))) {
     throw new ForbiddenError("لست ضمن فريق الاستقبال لهذه الفعالية");
   }
 }
@@ -45,16 +48,14 @@ export function availableSeats(e: Pick<Event, "mode" | "capacity" | "paidPlaces"
 }
 
 /** الأماكن المطلوبة للباقة في الفعالية الخاصة: دعوة = مكان، ودعوة بمرافق = مكانان */
-export async function requiredPrivatePlaces(eventId: string, db: Db = prisma): Promise<number> {
-  const [total, withCompanion] = await Promise.all([
-    db.invitation.count({ where: { eventId } }),
-    db.invitation.count({ where: { eventId, allowCompanion: true } }),
-  ]);
+export async function requiredPrivatePlaces(eventId: string): Promise<number> {
+  const invs = col(C.invitations).where("eventId", "==", eventId);
+  const [total, withCompanion] = await Promise.all([count(invs), count(invs.where("allowCompanion", "==", true))]);
   return total + withCompanion;
 }
 
-export async function requiredPlaces(event: Pick<Event, "id" | "mode" | "capacity">, db: Db = prisma) {
-  return event.mode === "PUBLIC" ? event.capacity : requiredPrivatePlaces(event.id, db);
+export async function requiredPlaces(event: Pick<Event, "id" | "mode" | "capacity">) {
+  return event.mode === "PUBLIC" ? event.capacity : requiredPrivatePlaces(event.id);
 }
 
 // ───────── الإنشاء والتعديل ─────────
@@ -102,8 +103,10 @@ function parseEventInput(input: EventInput) {
 export async function createEvent(ownerId: string, input: EventInput) {
   const d = parseEventInput(input);
   if (d.startsAt.getTime() < Date.now() - 60_000) throw new AppError("موعد الفعالية يجب أن يكون في المستقبل");
-  const event = await prisma.event.create({
-    data: {
+  const now = new Date();
+  const id = newId();
+  const event: Event = {
+      id,
       ownerId,
       title: d.title,
       hostName: d.hostName,
@@ -118,9 +121,18 @@ export async function createEvent(ownerId: string, input: EventInput) {
       capacity: d.capacity,
       fullPolicy: d.fullPolicy,
       status: "DRAFT",
-    },
-  });
-  await audit(prisma, { actorId: ownerId, action: "event.create", entityType: "Event", entityId: event.id });
+      templateId: null,
+      paidPlaces: 0,
+      reservedSeats: 0,
+      publicSlug: null,
+      publishedAt: null,
+      createdAt: now,
+      updatedAt: now,
+  };
+  const { id: _omit, ...data } = event;
+  void _omit;
+  await ref(C.events, id).set(data);
+  await audit({ actorId: ownerId, action: "event.create", entityType: "Event", entityId: id });
   return event;
 }
 
@@ -138,9 +150,7 @@ export async function updateEvent(ownerId: string, eventId: string, input: Event
       `الحد الأقصى أكبر من الأماكن المدفوعة (${event.paidPlaces}). اشترِ أماكن إضافية من صفحة الباقة لرفع السعة.`,
     );
   }
-  const updated = await prisma.event.update({
-    where: { id: event.id },
-    data: {
+  const patch = {
       title: d.title,
       hostName: d.hostName,
       description: d.description,
@@ -152,47 +162,60 @@ export async function updateEvent(ownerId: string, eventId: string, input: Event
       mode: d.mode,
       capacity: d.capacity,
       fullPolicy: d.fullPolicy,
-    },
+      updatedAt: new Date(),
+  };
+  // السعة تُعدّل بمعاملة حتى لا تقل عن المقاعد المحجوزة لحظة الحفظ
+  await db().runTransaction(async (tx) => {
+    const cur = (await tx.get(ref(C.events, event.id))).data() as Event;
+    if (d.capacity < cur.reservedSeats) {
+      throw new AppError(`لا يمكن جعل الحد الأقصى أقل من المقاعد المحجوزة حاليًا (${cur.reservedSeats})`);
+    }
+    tx.update(ref(C.events, event.id), patch);
   });
-  await audit(prisma, { actorId: ownerId, action: "event.update", entityType: "Event", entityId: event.id });
-  return updated;
+  await audit({ actorId: ownerId, action: "event.update", entityType: "Event", entityId: event.id });
+  return { ...event, ...patch };
 }
 
 export async function setEventTemplate(ownerId: string, eventId: string, templateId: string) {
   const event = await getOwnedEvent(eventId, ownerId);
-  const template = await prisma.template.findFirst({
-    where: {
-      id: templateId,
-      status: "ACTIVE",
-      OR: [{ visibility: "PUBLIC" }, { visibility: "PRIVATE", ownerId }],
-    },
-  });
-  if (!template) throw new NotFoundError("القالب غير متاح");
-  return prisma.event.update({ where: { id: event.id }, data: { templateId: template.id } });
+  const template = await getDoc<{ id: string; status: string; visibility: string; ownerId: string | null }>(C.templates, templateId);
+  const allowed =
+    template && template.status === "ACTIVE" && (template.visibility === "PUBLIC" || (template.visibility === "PRIVATE" && template.ownerId === ownerId));
+  if (!template || !allowed) throw new NotFoundError("القالب غير متاح");
+  await ref(C.events, event.id).update({ templateId: template.id, updatedAt: new Date() });
+  return { ...event, templateId: template.id };
 }
 
 export async function cancelEvent(ownerId: string, eventId: string) {
   const event = await getOwnedEvent(eventId, ownerId);
   if (event.status === "CANCELLED") return event;
-  const updated = await prisma.event.update({ where: { id: event.id }, data: { status: "CANCELLED" } });
-  await prisma.scheduledJob.updateMany({
-    where: { eventId: event.id, status: "PENDING" },
-    data: { status: "CANCELLED" },
-  });
-  await audit(prisma, { actorId: ownerId, action: "event.cancel", entityType: "Event", entityId: event.id });
-  return updated;
+  await ref(C.events, event.id).update({ status: "CANCELLED", updatedAt: new Date() });
+  const jobs = await getDocs<ScheduledJob>(col(C.scheduledJobs).where("eventId", "==", event.id).where("status", "==", "PENDING"));
+  for (const j of jobs) await ref(C.scheduledJobs, j.id).update({ status: "CANCELLED", finishedAt: new Date() });
+  await audit({ actorId: ownerId, action: "event.cancel", entityType: "Event", entityId: event.id });
+  return { ...event, status: "CANCELLED" };
 }
 
 export async function deleteDraftEvent(ownerId: string, eventId: string) {
   const event = await getOwnedEvent(eventId, ownerId);
   if (event.status !== "DRAFT" || event.paidPlaces > 0) throw new AppError("يمكن حذف المسودات غير المدفوعة فقط");
-  const payments = await prisma.payment.count({ where: { eventId: event.id } });
-  if (payments > 0) {
-    await prisma.payment.updateMany({ where: { eventId: event.id, status: "PENDING" }, data: { status: "CANCELLED" } });
+  const payments = await getDocs<{ id: string; status: string }>(col(C.payments).where("eventId", "==", event.id));
+  if (payments.length > 0) {
+    for (const p of payments) if (p.status === "PENDING") await ref(C.payments, p.id).update({ status: "CANCELLED", updatedAt: new Date() });
     throw new AppError("للمسودة عمليات دفع مسجلة، لذلك أُلغيت بدل حذفها. يمكنك إلغاء الفعالية.");
   }
-  await prisma.event.delete({ where: { id: event.id } });
-  await audit(prisma, { actorId: ownerId, action: "event.delete", entityType: "Event", entityId: event.id });
+  // حذف المسودة ومدعويها وقيودهم الفريدة
+  const invs = await col(C.invitations).where("eventId", "==", event.id).get();
+  const writer = db().bulkWriter();
+  for (const d of invs.docs) {
+    const inv = d.data() as { phone: string | null; email: string | null };
+    if (inv.phone) writer.delete(uniqueRefFor(`inv-phone:${event.id}:${inv.phone}`));
+    if (inv.email) writer.delete(uniqueRefFor(`inv-email:${event.id}:${inv.email}`));
+    writer.delete(d.ref);
+  }
+  writer.delete(ref(C.events, event.id));
+  await writer.close();
+  await audit({ actorId: ownerId, action: "event.delete", entityType: "Event", entityId: event.id });
 }
 
 // ───────── الإحصاءات ─────────
@@ -218,29 +241,24 @@ export type EventStats = {
   requiredPlaces: number;
 };
 
-export async function eventStats(event: Event, db: Db = prisma): Promise<EventStats> {
-  const [
-    invitations,
-    invitationsWithCompanion,
-    notSent,
-    deliveryFailed,
-    invitedWithoutResponse,
-    regGroups,
-    confirmedPeople,
-    attendedGuests,
-    attendedCompanions,
-  ] = await Promise.all([
-    db.invitation.count({ where: { eventId: event.id } }),
-    db.invitation.count({ where: { eventId: event.id, allowCompanion: true } }),
-    db.invitation.count({ where: { eventId: event.id, deliveryStatus: "NOT_SENT" } }),
-    db.invitation.count({ where: { eventId: event.id, deliveryStatus: "FAILED" } }),
-    db.invitation.count({ where: { eventId: event.id, registration: null } }),
-    db.registration.groupBy({ by: ["status"], where: { eventId: event.id }, _count: { _all: true } }),
-    db.registration.aggregate({ where: { eventId: event.id, status: "CONFIRMED" }, _sum: { seats: true } }),
-    db.ticket.count({ where: { eventId: event.id, kind: "PRIMARY", checkedInAt: { not: null } } }),
-    db.ticket.count({ where: { eventId: event.id, kind: "COMPANION", checkedInAt: { not: null } } }),
-  ]);
-  const byStatus = Object.fromEntries(regGroups.map((g) => [g.status, g._count._all])) as Record<string, number>;
+export async function eventStats(event: Event): Promise<EventStats> {
+  const invs = col(C.invitations).where("eventId", "==", event.id);
+  const regs = col(C.registrations).where("eventId", "==", event.id);
+  const tickets = col(C.tickets).where("eventId", "==", event.id).where("checkedIn", "==", true);
+  const statuses = ["CONFIRMED", "WAITLISTED", "OFFERED", "CANCELLED", "DECLINED"];
+  const [invitations, invitationsWithCompanion, notSent, deliveryFailed, invitedWithoutResponse, attendedGuests, attendedCompanions, ...regCounts] =
+    await Promise.all([
+      count(invs),
+      count(invs.where("allowCompanion", "==", true)),
+      count(invs.where("deliveryStatus", "==", "NOT_SENT")),
+      count(invs.where("deliveryStatus", "==", "FAILED")),
+      count(invs.where("regStatus", "==", null)),
+      count(tickets.where("kind", "==", "PRIMARY")),
+      count(tickets.where("kind", "==", "COMPANION")),
+      ...statuses.map((st) => count(regs.where("status", "==", st))),
+    ]);
+  const byStatus = Object.fromEntries(statuses.map((st, i) => [st, regCounts[i]])) as Record<string, number>;
+  const confirmedPeople = { _sum: { seats: event.reservedSeats } };
   const limit = seatLimit(event);
   return {
     invitations,

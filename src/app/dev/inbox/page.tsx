@@ -1,6 +1,6 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
-import { prisma } from "@/lib/db";
+import { inboxMessages } from "@/services/queries";
 import { env } from "@/lib/env";
 import { formatDateTime } from "@/lib/format";
 import { messageKindLabel, messageStatusLabel, channelLabel } from "@/lib/labels";
@@ -39,12 +39,7 @@ export default async function InboxPage({ searchParams }: { searchParams: Promis
   const sp = await searchParams;
   const user = await getCurrentUser();
   const to = (sp.to ?? "").trim();
-  const messages = await prisma.message.findMany({
-    where: to ? { recipient: { contains: to.replace(/^0/, "") } } : {},
-    orderBy: { createdAt: "desc" },
-    take: 100,
-    include: { event: { select: { title: true } } },
-  });
+  const messages = await inboxMessages(to);
   return (
     <>
       <TopBar user={user} home={user ? "/dashboard" : "/"} />

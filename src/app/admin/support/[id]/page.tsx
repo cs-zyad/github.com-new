@@ -1,5 +1,5 @@
 import { notFound } from "next/navigation";
-import { prisma } from "@/lib/db";
+import { supportTicketDetail } from "@/services/queries";
 import { requireAdmin } from "@/lib/auth";
 import { formatDateTime } from "@/lib/format";
 import { supportCategoryLabel, supportStatusLabel } from "@/lib/labels";
@@ -17,14 +17,7 @@ export default async function AdminSupportDetail({
 }) {
   const [{ id }, sp] = await Promise.all([params, searchParams]);
   const admin = await requireAdmin();
-  const t = await prisma.supportTicket.findUnique({
-    where: { id },
-    include: {
-      owner: { select: { name: true, email: true } },
-      event: { select: { title: true, id: true } },
-      comments: { include: { author: { select: { id: true, name: true, role: true } } }, orderBy: { createdAt: "asc" } },
-    },
-  });
+  const t = await supportTicketDetail(id);
   if (!t) notFound();
   return (
     <div className="stack">
@@ -33,8 +26,8 @@ export default async function AdminSupportDetail({
         title={t.subject}
         subtitle={
           <span>
-            <Badge tone="info">{supportCategoryLabel[t.category]}</Badge> <Badge tone="warn">{supportStatusLabel[t.status]}</Badge> · {t.owner.name} (
-            <bdi className="ltr">{t.owner.email}</bdi>) · {formatDateTime(t.createdAt)}
+            <Badge tone="info">{supportCategoryLabel[t.category]}</Badge> <Badge tone="warn">{supportStatusLabel[t.status]}</Badge> · {t.owner?.name} (
+            <bdi className="ltr">{t.owner?.email}</bdi>) · {formatDateTime(t.createdAt)}
             {t.event ? ` · ${t.event.title}` : ""}
           </span>
         }

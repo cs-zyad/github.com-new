@@ -1,5 +1,6 @@
-import { prisma, type Db } from "./db";
+import { C, col, getDocs } from "./firestore";
 import { audit } from "./audit";
+import type { Setting } from "./types";
 
 /**
  * إعدادات التشغيل القابلة للمراجعة من لوحة الأدمن.
@@ -47,8 +48,8 @@ export const DEFAULT_SETTINGS: OperatingSettings = {
 
 export const SETTING_KEYS = Object.keys(DEFAULT_SETTINGS) as (keyof OperatingSettings)[];
 
-export async function getSettings(db: Db = prisma): Promise<OperatingSettings> {
-  const rows = await db.setting.findMany();
+export async function getSettings(): Promise<OperatingSettings> {
+  const rows = (await getDocs<Setting>(col(C.settings))).map((r) => ({ key: r.id, value: r.value }));
   const result = structuredClone(DEFAULT_SETTINGS) as Record<string, unknown>;
   for (const row of rows) {
     if (row.key in result) {
@@ -62,21 +63,13 @@ export async function getSettings(db: Db = prisma): Promise<OperatingSettings> {
   return result as OperatingSettings;
 }
 
-export async function updateSettings(
-  patch: Partial<OperatingSettings>,
-  actorId: string,
-  db: Db = prisma,
-): Promise<void> {
-  const before = await getSettings(db);
+export async function updateSettings(patch: Partial<OperatingSettings>, actorId: string): Promise<void> {
+  const before = await getSettings();
   for (const [key, value] of Object.entries(patch)) {
     if (!SETTING_KEYS.includes(key as keyof OperatingSettings)) continue;
-    await db.setting.upsert({
-      where: { key },
-      create: { key, value: JSON.stringify(value), updatedById: actorId },
-      update: { value: JSON.stringify(value), updatedById: actorId },
-    });
+    await col(C.settings).doc(key).set({ value: JSON.stringify(value), updatedById: actorId, updatedAt: new Date() });
   }
-  await audit(db, {
+  await audit({
     actorId,
     action: "settings.update",
     entityType: "Setting",

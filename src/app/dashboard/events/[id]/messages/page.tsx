@@ -1,5 +1,5 @@
 import { requireUser } from "@/lib/auth";
-import { prisma } from "@/lib/db";
+import { eventMessages } from "@/services/queries";
 import { getOwnedEvent } from "@/services/events";
 import { formatDateTime } from "@/lib/format";
 import { messageKindLabel, messageStatusLabel, channelLabel, billingLabel } from "@/lib/labels";
@@ -10,11 +10,7 @@ export default async function EventMessagesPage({ params }: { params: Promise<{ 
   const { id } = await params;
   const user = await requireUser();
   const event = await getOwnedEvent(id, user.id);
-  const messages = await prisma.message.findMany({
-    where: { eventId: event.id, kind: { not: "STAFF_INVITE" } },
-    orderBy: { createdAt: "desc" },
-    take: 300,
-  });
+  const messages = await eventMessages(event.id);
   return (
     <div className="stack">
       <h2>سجل الرسائل</h2>

@@ -1,4 +1,4 @@
-import { prisma } from "@/lib/db";
+import { adminTemplates } from "@/services/queries";
 import { parsePalette } from "@/services/designs";
 import { eventView } from "@/services/presentation";
 import { brand } from "@/config/brand";
@@ -50,10 +50,7 @@ function CategorySelect({ id, defaultValue }: { id: string; defaultValue?: strin
 
 export default async function AdminTemplates({ searchParams }: { searchParams: Promise<Record<string, string>> }) {
   const sp = await searchParams;
-  const templates = await prisma.template.findMany({
-    orderBy: [{ visibility: "asc" }, { sortOrder: "asc" }],
-    include: { owner: { select: { name: true, email: true } }, _count: { select: { events: true } } },
-  });
+  const templates = await adminTemplates();
   return (
     <div className="stack">
       <Flash sp={sp} />

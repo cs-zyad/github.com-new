@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { prisma } from "@/lib/db";
+import { adminDesignRequests } from "@/services/queries";
 import { formatDateTime } from "@/lib/format";
 import { designStatusLabel } from "@/lib/labels";
 import { PageHeader, Badge, Empty, Money } from "@/components/ui";
@@ -7,11 +7,7 @@ import { PageHeader, Badge, Empty, Money } from "@/components/ui";
 export const metadata = { title: "طلبات التصميم" };
 
 export default async function AdminDesigns() {
-  const list = await prisma.designRequest.findMany({
-    orderBy: { updatedAt: "desc" },
-    include: { owner: { select: { name: true, email: true } } },
-    take: 200,
-  });
+  const list = await adminDesignRequests();
   return (
     <div className="stack">
       <PageHeader title="طلبات التصميم الخاص" subtitle="راجع الطلب، أرسل عرض سعر، وبعد دفع المنظّم سلّم التصميم كقالب خاص به." />

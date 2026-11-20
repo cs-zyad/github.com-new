@@ -1,5 +1,5 @@
 import { requireUser } from "@/lib/auth";
-import { prisma } from "@/lib/db";
+import { waitlistFor } from "@/services/queries";
 import { randomToken } from "@/lib/ids";
 import { getOwnedEvent, availableSeats } from "@/services/events";
 import { getSettings } from "@/lib/settings";
@@ -20,10 +20,7 @@ export default async function WaitlistPage({
   const user = await requireUser();
   const event = await getOwnedEvent(id, user.id);
   const settings = await getSettings();
-  const list = await prisma.registration.findMany({
-    where: { eventId: event.id, status: { in: ["WAITLISTED", "OFFERED"] } },
-    orderBy: { createdAt: "asc" },
-  });
+  const list = await waitlistFor(event.id);
   const free = availableSeats(event);
 
   return (

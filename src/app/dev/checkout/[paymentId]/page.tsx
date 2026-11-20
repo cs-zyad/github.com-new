@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { notFound, redirect } from "next/navigation";
-import { prisma } from "@/lib/db";
+import { C, getDoc } from "@/lib/firestore";
+import type { Payment } from "@/lib/types";
 import { env } from "@/lib/env";
 import { requireUser } from "@/lib/auth";
 import { formatMoney } from "@/lib/format";
@@ -25,8 +26,8 @@ async function simulate(fd: FormData) {
   const user = await requireUser();
   const id = String(fd.get("paymentId"));
   const type = fd.get("type") === "failed" ? "payment.failed" : "payment.succeeded";
-  const p = await prisma.payment.findFirst({ where: { id, ownerId: user.id } });
-  if (!p || p.provider !== "mock") notFound();
+  const p = await getDoc<Payment>(C.payments, id);
+  if (!p || p.ownerId !== user.id || p.provider !== "mock") notFound();
   // معرّف إشعار ثابت لكل عملية: الضغط مرة أخرى يعيد نفس الإشعار فيُثبت أنه لا يُعالج مرتين
   const wh = buildMockWebhook({
     providerRef: p.providerRef!,
@@ -61,8 +62,8 @@ export default async function MockCheckout({
   if (!env.demoMode) notFound();
   const [{ paymentId }, sp] = await Promise.all([params, searchParams]);
   const user = await requireUser();
-  const p = await prisma.payment.findFirst({ where: { id: paymentId, ownerId: user.id }, include: { event: { select: { title: true } } } });
-  if (!p) notFound();
+  const p = await getDoc<Payment>(C.payments, paymentId);
+  if (!p || p.ownerId !== user.id) notFound();
   return (
     <>
       <TopBar user={user} />

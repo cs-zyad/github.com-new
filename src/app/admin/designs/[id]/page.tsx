@@ -1,5 +1,5 @@
 import { notFound } from "next/navigation";
-import { prisma } from "@/lib/db";
+import { designRequestDetail } from "@/services/queries";
 import { requireAdmin } from "@/lib/auth";
 import { formatDateTime } from "@/lib/format";
 import { designStatusLabel } from "@/lib/labels";
@@ -25,16 +25,7 @@ export default async function AdminDesignDetail({
 }) {
   const [{ id }, sp] = await Promise.all([params, searchParams]);
   const admin = await requireAdmin();
-  const r = await prisma.designRequest.findUnique({
-    where: { id },
-    include: {
-      owner: { select: { name: true, email: true } },
-      event: { select: { title: true } },
-      comments: { include: { author: { select: { id: true, name: true, role: true } } }, orderBy: { createdAt: "asc" } },
-      payments: true,
-      deliveredTemplate: true,
-    },
-  });
+  const r = await designRequestDetail(id);
   if (!r) notFound();
   return (
     <div className="stack">
@@ -43,7 +34,7 @@ export default async function AdminDesignDetail({
         title={r.title}
         subtitle={
           <span>
-            <Badge tone="info">{designStatusLabel[r.status]}</Badge> · {r.owner.name} (<bdi className="ltr">{r.owner.email}</bdi>) ·{" "}
+            <Badge tone="info">{designStatusLabel[r.status]}</Badge> · {r.owner?.name} (<bdi className="ltr">{r.owner?.email}</bdi>) ·{" "}
             {formatDateTime(r.createdAt)}
           </span>
         }

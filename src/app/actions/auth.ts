@@ -55,7 +55,8 @@ export async function setPasswordAction(_prev: FormState, fd: FormData): Promise
     if (str(fd, "password") !== str(fd, "password2")) return { error: "كلمتا المرور غير متطابقتين" };
     const user = await setPasswordWithToken(str(fd, "token"), str(fd, "password"));
     await createSession(user.id);
-    const owns = await import("@/lib/db").then(({ prisma }) => prisma.event.count({ where: { ownerId: user.id } }));
+    const { C, col, count } = await import("@/lib/firestore");
+    const owns = await count(col(C.events).where("ownerId", "==", user.id));
     dest = owns > 0 ? "/dashboard" : "/checkin";
   } catch (e) {
     return { error: errorMessage(e) };

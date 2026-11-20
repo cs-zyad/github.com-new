@@ -1,6 +1,7 @@
 import { notFound } from "next/navigation";
 import { requireUser } from "@/lib/auth";
-import { prisma } from "@/lib/db";
+import { C, getDoc } from "@/lib/firestore";
+import type { Event } from "@/lib/types";
 import { NavLinks } from "@/components/NavLinks";
 import { EventStatusBadge, Badge } from "@/components/ui";
 import { modeLabel } from "@/lib/labels";
@@ -9,8 +10,9 @@ import { formatDateTime } from "@/lib/format";
 export default async function EventLayout({ children, params }: { children: React.ReactNode; params: Promise<{ id: string }> }) {
   const { id } = await params;
   const user = await requireUser();
-  const event = await prisma.event.findFirst({ where: { id, ownerId: user.id } });
-  if (!event) notFound();
+  const found = await getDoc<Event>(C.events, id);
+  if (!found || found.ownerId !== user.id) notFound();
+  const event = found;
   const base = `/dashboard/events/${event.id}`;
   const tabs =
     event.mode === "PRIVATE"

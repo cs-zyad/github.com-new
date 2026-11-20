@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { prisma } from "@/lib/db";
+import { store } from "./db";
 import { buildMockWebhook } from "@/providers/payments/mock";
 import { handlePaymentWebhook, startPackageCheckout, startExtraPlacesCheckout, startTopupCheckout } from "@/services/payments";
 import { quotePackage } from "@/services/pricing";
@@ -12,7 +12,7 @@ beforeEach(async () => {
 });
 
 async function paySucceeded(paymentId: string, eventId?: string) {
-  const p = await prisma.payment.findUniqueOrThrow({ where: { id: paymentId } });
+  const p = await store.payment.findUniqueOrThrow({ where: { id: paymentId } });
   const wh = buildMockWebhook({
     providerRef: p.providerRef!,
     paymentId: p.id,
@@ -56,7 +56,7 @@ describe("الباقات والدفع", () => {
     const { payment } = await startPackageCheckout(owner.id, event.id);
     expect(payment.places).toBe(50);
     // قبل الإشعار: لم يتغير شيء
-    expect((await prisma.event.findUniqueOrThrow({ where: { id: event.id } })).paidPlaces).toBe(0);
+    expect((await store.event.findUniqueOrThrow({ where: { id: event.id } })).paidPlaces).toBe(0);
 
     const first = await paySucceeded(payment.id, "evt_same_1");
     expect(first.result.outcome).toBe("PROCESSED");
@@ -66,7 +66,7 @@ describe("الباقات والدفع", () => {
     const other = await paySucceeded(payment.id, "evt_other_2");
     expect(other.result.outcome).toBe("IGNORED");
 
-    const fresh = await prisma.event.findUniqueOrThrow({ where: { id: event.id } });
+    const fresh = await store.event.findUniqueOrThrow({ where: { id: event.id } });
     expect(fresh.paidPlaces).toBe(50);
     expect(fresh.status).toBe("ACTIVE");
     expect(fresh.publicSlug).toBeTruthy();
@@ -88,7 +88,7 @@ describe("الباقات والدفع", () => {
     });
     const results = await Promise.all(Array.from({ length: 6 }, () => handlePaymentWebhook(wh.rawBody, wh.headers, "mock")));
     expect(results.filter((r) => r.outcome === "PROCESSED").length).toBe(1);
-    expect((await prisma.event.findUniqueOrThrow({ where: { id: event.id } })).paidPlaces).toBe(50);
+    expect((await store.event.findUniqueOrThrow({ where: { id: event.id } })).paidPlaces).toBe(50);
   });
 
   it("رفض التوقيع غير الصحيح والمبلغ غير المطابق", async () => {
@@ -121,7 +121,7 @@ describe("الباقات والدفع", () => {
     await handlePaymentWebhook(a.wh.rawBody, a.wh.headers, "mock");
     await paySucceeded(payment.id, "evt_topup_retry");
     expect(await getBalance(owner.id)).toBe(5000);
-    expect(await prisma.walletTransaction.count({ where: { type: "TOPUP" } })).toBe(1);
+    expect(await store.walletTransaction.count({ where: { type: "TOPUP" } })).toBe(1);
   });
 
   it("الأماكن الإضافية بعد الدفع ترفع الاستحقاق (والسعة في العامة)", async () => {
@@ -130,7 +130,7 @@ describe("الباقات والدفع", () => {
     const { payment } = await startExtraPlacesCheckout(owner.id, event.id, 10);
     expect(payment.amount).toBe(10 * 200);
     await paySucceeded(payment.id);
-    const fresh = await prisma.event.findUniqueOrThrow({ where: { id: event.id } });
+    const fresh = await store.event.findUniqueOrThrow({ where: { id: event.id } });
     expect(fresh.paidPlaces).toBe(60);
     expect(fresh.capacity).toBe(60);
   });
@@ -140,7 +140,7 @@ describe("الباقات والدفع", () => {
     const event = await makeEvent(owner.id, { status: "DRAFT", paidPlaces: 0 });
     await expect(startPackageCheckout(owner.id, event.id)).rejects.toThrow(/قالب/);
     const tpl = await makeTemplate();
-    await prisma.event.update({ where: { id: event.id }, data: { templateId: tpl.id } });
+    await store.event.update({ where: { id: event.id }, data: { templateId: tpl.id } });
     await expect(startPackageCheckout(owner.id, event.id)).rejects.toThrow(/المدعوين/);
   });
 });

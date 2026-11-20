@@ -1,22 +1,11 @@
 import Link from "next/link";
-import { prisma } from "@/lib/db";
+import { adminOverview } from "@/services/queries";
 import { providerStatus } from "@/providers/messaging";
 import { env } from "@/lib/env";
 import { Stat, Money, PageHeader, Badge } from "@/components/ui";
 
 export default async function AdminHome() {
-  const [users, events, activeEvents, paid, walletSpend, packageOps, pendingDesigns, openTickets, tickets, attended] = await Promise.all([
-    prisma.user.count({ where: { role: "USER" } }),
-    prisma.event.count(),
-    prisma.event.count({ where: { status: "ACTIVE" } }),
-    prisma.payment.aggregate({ where: { status: "PAID" }, _sum: { amount: true } }),
-    prisma.message.aggregate({ where: { billing: "WALLET", status: "SENT" }, _sum: { cost: true } }),
-    prisma.message.aggregate({ where: { billing: "PACKAGE", status: "SENT" }, _sum: { operatingCost: true } }),
-    prisma.designRequest.count({ where: { status: { in: ["SUBMITTED", "PAID", "IN_PROGRESS"] } } }),
-    prisma.supportTicket.count({ where: { status: { in: ["OPEN", "IN_PROGRESS"] } } }),
-    prisma.ticket.count({ where: { status: "ACTIVE" } }),
-    prisma.ticket.count({ where: { checkedInAt: { not: null } } }),
-  ]);
+  const { users, events, activeEvents, paid, walletSpend, packageOps, pendingDesigns, openTickets, tickets, attended } = await adminOverview();
   const ps = providerStatus();
   return (
     <div className="stack">
@@ -24,9 +13,9 @@ export default async function AdminHome() {
       <div className="grid-stats">
         <Stat label="المنظّمون" value={users} />
         <Stat label="الفعاليات" value={events} hint={`${activeEvents} نشطة`} />
-        <Stat label="إجمالي المدفوع" value={<Money value={paid._sum.amount ?? 0} />} highlight />
-        <Stat label="إيراد الرسائل (من الرصيد)" value={<Money value={walletSpend._sum.cost ?? 0} />} />
-        <Stat label="تكلفة رسائل التأكيد (على الباقات)" value={<Money value={packageOps._sum.operatingCost ?? 0} />} hint="تقديرية" />
+        <Stat label="إجمالي المدفوع" value={<Money value={paid} />} highlight />
+        <Stat label="إيراد الرسائل (من الرصيد)" value={<Money value={walletSpend} />} />
+        <Stat label="تكلفة رسائل التأكيد (على الباقات)" value={<Money value={packageOps} />} hint="تقديرية" />
         <Stat label="التذاكر / الحضور" value={`${attended}/${tickets}`} />
       </div>
       <div className="grid-2">

@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { prisma } from "@/lib/db";
+import { store } from "./db";
 import { confirmInvitation, registerPublic, cancelByGuest } from "@/services/rsvp";
 import { checkIn, searchTickets, extractTicketCode } from "@/services/checkin";
 import { ForbiddenError } from "@/lib/errors";
@@ -12,7 +12,7 @@ async function setupConfirmedWithCompanion() {
   const staff = await makeUser({ name: "عضو الاستقبال" });
   const outsider = await makeUser({ name: "غير معيّن" });
   const event = await makeEvent(owner.id, { capacity: 10 });
-  await prisma.eventStaff.create({ data: { eventId: event.id, userId: staff.id, addedById: owner.id } });
+  await store.eventStaff.create({ data: { eventId: event.id, userId: staff.id, addedById: owner.id } });
   const inv = await makeInvitation(event.id, { allowCompanion: true, name: "خالد الحربي" });
   const r = await confirmInvitation({
     token: inv.token,
@@ -20,7 +20,7 @@ async function setupConfirmedWithCompanion() {
     withCompanion: true,
   });
   if (r.status !== "CONFIRMED") throw new Error("expected confirmed");
-  const tickets = await prisma.ticket.findMany({ where: { eventId: event.id }, orderBy: { kind: "desc" } });
+  const tickets = await store.ticket.findMany({ where: { eventId: event.id }, orderBy: { kind: "desc" } });
   return { owner, staff, outsider, event, inv, tickets, accessToken: r.accessToken };
 }
 
@@ -35,7 +35,7 @@ describe("تسجيل الحضور", () => {
 
     const a = await checkIn({ staffUserId: staff.id, eventId: event.id, method: "SCAN", code: primary.code });
     expect(a.result).toBe("SUCCESS");
-    const stillOut = await prisma.ticket.findUniqueOrThrow({ where: { id: companion.id } });
+    const stillOut = await store.ticket.findUniqueOrThrow({ where: { id: companion.id } });
     expect(stillOut.checkedInAt).toBeNull();
     const b = await checkIn({ staffUserId: staff.id, eventId: event.id, method: "SCAN", code: companion.code });
     expect(b.result).toBe("SUCCESS");
@@ -55,7 +55,7 @@ describe("تسجيل الحضور", () => {
       expect(second.checkedInAt.getTime()).toBe(first.checkedInAt.getTime());
       expect(second.method).toBe("SCAN");
     }
-    const fresh = await prisma.ticket.findUniqueOrThrow({ where: { id: t.id } });
+    const fresh = await store.ticket.findUniqueOrThrow({ where: { id: t.id } });
     expect(fresh.checkInMethod).toBe("SCAN");
   });
 
@@ -78,7 +78,7 @@ describe("تسجيل الحضور", () => {
     const s = await checkIn({ staffUserId: staff.id, eventId: event.id, method: "SCAN", code: t.code });
     expect(m.result).toBe("SUCCESS");
     expect(s.result).toBe("ALREADY");
-    const fresh = await prisma.ticket.findUniqueOrThrow({ where: { id: t.id } });
+    const fresh = await store.ticket.findUniqueOrThrow({ where: { id: t.id } });
     expect(fresh.checkedInById).toBe(staff.id);
     expect(fresh.checkInMethod).toBe("MANUAL");
   });
@@ -89,7 +89,7 @@ describe("تسجيل الحضور", () => {
       ForbiddenError,
     );
     await expect(searchTickets(outsider.id, event.id, "خالد")).rejects.toBeInstanceOf(ForbiddenError);
-    const t = await prisma.ticket.findUniqueOrThrow({ where: { id: tickets[0].id } });
+    const t = await store.ticket.findUniqueOrThrow({ where: { id: tickets[0].id } });
     expect(t.checkedInAt).toBeNull();
   });
 
@@ -98,7 +98,7 @@ describe("تسجيل الحضور", () => {
     const other = await makeUser();
     const otherEvent = await makeEvent(other.id, { mode: "PUBLIC", capacity: 5, paidPlaces: 5 });
     await registerPublic({ slug: otherEvent.publicSlug!, contact: { name: "نورة", contactMethod: "EMAIL", email: "n@x.com" } });
-    const foreign = await prisma.ticket.findFirstOrThrow({ where: { eventId: otherEvent.id } });
+    const foreign = await store.ticket.findFirstOrThrow({ where: { eventId: otherEvent.id } });
     const r = await checkIn({ staffUserId: staff.id, eventId: event.id, method: "SCAN", code: foreign.code });
     expect(r.result).toBe("WRONG_EVENT");
     expect("holderName" in r).toBe(false);

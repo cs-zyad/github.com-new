@@ -1,5 +1,5 @@
 import { notFound } from "next/navigation";
-import { prisma } from "@/lib/db";
+import { eventBySlug } from "@/services/queries";
 import { randomToken } from "@/lib/ids";
 import { eventView } from "@/services/presentation";
 import { parsePalette } from "@/services/designs";
@@ -11,13 +11,13 @@ import { PublicForm } from "./PublicForm";
 
 export async function generateMetadata({ params }: { params: Promise<{ slug: string }> }) {
   const { slug } = await params;
-  const e = await prisma.event.findUnique({ where: { publicSlug: slug }, select: { title: true } });
+  const e = await eventBySlug(slug);
   return { title: e?.title ?? "فعالية" };
 }
 
 export default async function PublicEventPage({ params }: { params: Promise<{ slug: string }> }) {
   const { slug } = await params;
-  const event = await prisma.event.findUnique({ where: { publicSlug: slug }, include: { template: true } });
+  const event = await eventBySlug(slug);
   if (!event || event.mode !== "PUBLIC") notFound();
   const view = eventView(event);
   const closed = rsvpClosedReason(event);

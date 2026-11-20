@@ -1,40 +1,23 @@
 import { z } from "zod";
-import type { Event, Registration } from "@prisma/client";
-import { prisma, withTx, isUniqueViolation, type Tx } from "@/lib/db";
+import { C, col, ref, getDoc, getDocs, getFirst, newId, runTx, txGet, uniqueRef, withoutId, type Transaction } from "@/lib/firestore";
 import { AppError, NotFoundError } from "@/lib/errors";
 import { normalizeEmail, normalizePhone } from "@/lib/contact";
 import { randomToken } from "@/lib/ids";
 import { getSettings, type OperatingSettings } from "@/lib/settings";
-import { audit } from "@/lib/audit";
-import { availableSeats } from "./events";
-import { issueTickets, cancelTickets } from "./tickets";
+import { auditTx } from "@/lib/audit";
+import { availableSeats, seatLimit } from "./events";
+import { readTickets, writeTickets, cancelTicketsWrite } from "./tickets";
 import { composeConfirmation, composeTicketResend } from "./compose";
-import { enqueuePackageMessage, kickOutbox } from "./messaging";
-
-// ───────── السعة: الحجز والإفراج الذرّي ─────────
+import { writePackageMessage, kickOutbox } from "./messaging";
+import type { Event, Invitation, Registration, Template, Ticket } from "@/lib/types";
 
 /**
- * حجز مقاعد بتحديث شرطي واحد — آمن للتزامن في SQLite وPostgreSQL:
- * لا ينجح إلا إذا بقي الحجز ضمن الحد (والأماكن المدفوعة في الفعالية العامة).
+ * التأكيد والسعة على Firestore:
+ * كل عملية حجز معاملة واحدة تقرأ وثيقة الفعالية والتسجيل والتذاكر ثم تكتب.
+ * Firestore يضمن العزل: معاملتان متزامنتان على نفس الفعالية لا تريان نفس العدد،
+ * وإحداهما تُعاد تلقائيًا بالقيم الجديدة — فلا يتجاوز الحجز السعة.
+ * التسجيل للدعوة الخاصة معرّفه ثابت (inv_<invitationId>) فلا يتكرر.
  */
-export async function reserveSeats(tx: Tx, eventId: string, n: number): Promise<boolean> {
-  const count = await tx.$executeRaw`
-    UPDATE "Event"
-    SET "reservedSeats" = "reservedSeats" + ${n}
-    WHERE "id" = ${eventId}
-      AND "status" = 'ACTIVE'
-      AND "reservedSeats" + ${n} <= "capacity"
-      AND ("mode" <> 'PUBLIC' OR "reservedSeats" + ${n} <= "paidPlaces")`;
-  return count === 1;
-}
-
-export async function releaseSeats(tx: Tx, eventId: string, n: number) {
-  if (n <= 0) return;
-  await tx.event.updateMany({
-    where: { id: eventId, reservedSeats: { gte: n } },
-    data: { reservedSeats: { decrement: n } },
-  });
-}
 
 // ───────── التحقق من المدخلات ─────────
 
@@ -63,8 +46,9 @@ export const contactSchema = z
   });
 
 export type ContactInput = z.input<typeof contactSchema>;
+type Contact = z.output<typeof contactSchema>;
 
-function parseContact(input: ContactInput) {
+function parseContact(input: ContactInput): Contact {
   const r = contactSchema.safeParse(input);
   if (!r.success) throw new AppError(r.error.issues[0]?.message ?? "بيانات غير صالحة");
   return r.data;
@@ -99,57 +83,95 @@ export type RsvpOutcome =
   | { status: "ALREADY_REGISTERED"; resent: boolean; waitlisted: boolean }
   | { status: "CLOSED"; reason: ClosedReason };
 
-/** تأكيد الحجز بعد نجاح حجز المقاعد: التذاكر + رسالة التأكيد (ضمن الباقة) */
-async function finalizeConfirmed(
-  tx: Tx,
-  event: Event,
-  reg: Registration,
-  settings: OperatingSettings,
+/** هل يتسع الحجز؟ (داخل المعاملة على وثيقة الفعالية المقروءة) */
+function canReserve(event: Event, n: number) {
+  return event.status === "ACTIVE" && event.reservedSeats + n <= seatLimit(event);
+}
+
+function nowFields() {
+  return new Date();
+}
+
+/** بيانات تسجيل جديد */
+function newRegistration(
+  base: Partial<Registration> & Pick<Registration, "eventId" | "source" | "name" | "contactMethod" | "status">,
+): Omit<Registration, "id"> {
+  const now = nowFields();
+  return {
+    invitationId: null,
+    phone: null,
+    email: null,
+    dedupeKey: null,
+    idempotencyKey: null,
+    withCompanion: false,
+    seats: 0,
+    seatsRequested: 1,
+    accessToken: randomToken(),
+    offeredAt: null,
+    offerExpiresAt: null,
+    confirmedAt: null,
+    cancelledAt: null,
+    lastTicketResendAt: null,
+    version: 1,
+    createdAt: now,
+    updatedAt: now,
+    ...base,
+  } as Omit<Registration, "id">;
+}
+
+/**
+ * كتابة تأكيد ناجح: حجز المقاعد + التسجيل + التذاكر + رسالة التأكيد (ضمن الباقة).
+ * كل القراءات تمت مسبقًا داخل نفس المعاملة.
+ */
+function writeConfirmed(
+  tx: Transaction,
+  ctx: {
+    event: Event;
+    regId: string;
+    reg: Omit<Registration, "id">;
+    prevSeats: number;
+    tickets: { primary: Ticket | null; companion: Ticket | null };
+    invitation: Invitation | null;
+    settings: OperatingSettings;
+  },
 ) {
-  const tickets = await issueTickets(tx, {
-    eventId: event.id,
-    registrationId: reg.id,
-    holderName: reg.name,
-    withCompanion: reg.withCompanion,
-  });
-  const msg = composeConfirmation(event, reg, tickets);
+  const { event, regId, reg } = ctx;
+  tx.update(ref(C.events, event.id), { reservedSeats: event.reservedSeats - ctx.prevSeats + reg.seats, updatedAt: new Date() });
+  tx.set(ref(C.registrations, regId), reg);
+  const issued = writeTickets(tx, ctx.tickets, { eventId: event.id, registrationId: regId, holderName: reg.name, withCompanion: reg.withCompanion });
+  if (ctx.invitation) tx.update(ref(C.invitations, ctx.invitation.id), { regStatus: "CONFIRMED", registrationId: regId, updatedAt: new Date() });
+  const msg = composeConfirmation(event, reg, issued);
   const recipient = reg.contactMethod === "WHATSAPP" ? reg.phone : reg.email;
   if (recipient) {
-    await enqueuePackageMessage(tx, {
+    writePackageMessage(tx, {
       ownerId: event.ownerId,
       eventId: event.id,
-      registrationId: reg.id,
+      registrationId: regId,
       kind: "CONFIRMATION",
       channel: reg.contactMethod as "WHATSAPP" | "EMAIL",
       recipient,
       subject: msg.subject,
       body: msg.body,
-      idempotencyKey: `confirm:${reg.id}:${reg.confirmedAt?.getTime() ?? 0}`,
-      settings,
+      idempotencyKey: `confirm:${regId}:${reg.confirmedAt?.getTime() ?? 0}`,
+      settings: ctx.settings,
     });
-  }
-  return tickets;
-}
-
-/** تشغيل المعاملة مع إعادة محاولة واحدة عند تعارض القيود الفريدة (تأكيد متزامن لنفس الشخص) */
-async function runRsvp<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
-  try {
-    return await withTx(fn);
-  } catch (e) {
-    if (isUniqueViolation(e)) return withTx(fn);
-    throw e;
   }
 }
 
 // ───────── الدعوة الخاصة ─────────
 
+async function findInvitationByToken(token: string) {
+  if (!token) return null;
+  return getFirst<Invitation>(col(C.invitations).where("token", "==", token));
+}
+
 export async function getInvitationByToken(token: string) {
-  const inv = await prisma.invitation.findUnique({
-    where: { token },
-    include: { event: { include: { template: true } }, registration: { include: { tickets: true } } },
-  });
+  const inv = await findInvitationByToken(token);
   if (!inv) throw new NotFoundError("الدعوة غير موجودة أو الرابط غير صحيح");
-  return inv;
+  const event = (await getDoc<Event>(C.events, inv.eventId))!;
+  const template = await getDoc<Template>(C.templates, event.templateId);
+  const registration = await getDoc<Registration>(C.registrations, `inv_${inv.id}`);
+  return { ...inv, event: { ...event, template }, registration };
 }
 
 export async function confirmInvitation(params: {
@@ -161,55 +183,65 @@ export async function confirmInvitation(params: {
 }): Promise<RsvpOutcome> {
   const contact = parseContact(params.contact);
   const settings = await getSettings();
-  const outcome = await runRsvp(async (tx): Promise<RsvpOutcome> => {
-    const inv = await tx.invitation.findUnique({ where: { token: params.token }, include: { event: true, registration: true } });
-    if (!inv || inv.event.mode !== "PRIVATE") throw new NotFoundError("الدعوة غير موجودة");
-    const event = inv.event;
+  const found = await findInvitationByToken(params.token);
+  if (!found) throw new NotFoundError("الدعوة غير موجودة");
+
+  const outcome = await runTx(async (tx): Promise<RsvpOutcome> => {
+    // ── القراءات ──
+    const inv = await txGet<Invitation>(tx, ref(C.invitations, found.id));
+    if (!inv) throw new NotFoundError("الدعوة غير موجودة");
+    const event = await txGet<Event>(tx, ref(C.events, inv.eventId));
+    if (!event || event.mode !== "PRIVATE") throw new NotFoundError("الدعوة غير موجودة");
+    const regId = `inv_${inv.id}`;
+    const reg = await txGet<Registration>(tx, ref(C.registrations, regId));
+    const tickets = await readTickets(tx, regId);
+
     const closed = rsvpClosedReason(event);
     if (closed) return { status: "CLOSED", reason: closed };
-
     const want = params.withCompanion && inv.allowCompanion ? 2 : 1;
-    const reg = inv.registration;
 
     if (reg?.status === "CONFIRMED") return { status: "CONFIRMED", accessToken: reg.accessToken, already: true };
     if (reg?.status === "WAITLISTED") return { status: "WAITLISTED", accessToken: reg.accessToken, already: true };
     if (reg?.status === "OFFERED") {
-      return claimOfferInTx(tx, event, reg, { withCompanion: want === 2, contact, settings });
+      return claimOfferInTx(tx, { event, reg, invitation: inv, tickets, withCompanion: want === 2, contact, settings });
     }
 
-    const ok = await reserveSeats(tx, event.id, want);
-    if (!ok) {
-      const fresh = await tx.event.findUniqueOrThrow({ where: { id: event.id } });
-      if (want === 2 && availableSeats(fresh) === 1 && !(params.joinWaitlist && fresh.fullPolicy === "WAITLIST")) {
-        return { status: "ONLY_ONE_LEFT" };
-      }
-      if (fresh.fullPolicy === "WAITLIST") {
-        const data = {
-          name: contact.name,
-          contactMethod: contact.contactMethod,
-          phone: contact.phone,
-          email: contact.email,
-          withCompanion: want === 2,
-          seats: 0,
-          seatsRequested: want,
-          status: "WAITLISTED",
-        };
-        const w = reg
-          ? await guardedUpdate(tx, reg, data)
-          : await tx.registration.create({
-              data: { ...data, eventId: event.id, invitationId: inv.id, source: "INVITATION", accessToken: randomToken() },
-            });
-        return { status: "WAITLISTED", accessToken: w.accessToken, already: false };
-      }
-      return { status: "FULL" };
-    }
-
+    // ── القرار ثم الكتابة ──
     const now = new Date();
-    const data = {
+    const base = {
+      eventId: event.id,
+      invitationId: inv.id,
+      source: "INVITATION",
       name: contact.name,
       contactMethod: contact.contactMethod,
       phone: contact.phone,
       email: contact.email,
+    };
+    if (!canReserve(event, want)) {
+      if (want === 2 && availableSeats(event) === 1 && !(params.joinWaitlist && event.fullPolicy === "WAITLIST")) {
+        return { status: "ONLY_ONE_LEFT" };
+      }
+      if (event.fullPolicy === "WAITLIST") {
+        const data = {
+          ...(reg ? withoutId(reg) : newRegistration({ ...base, status: "WAITLISTED" })),
+          ...base,
+          withCompanion: want === 2,
+          seats: 0,
+          seatsRequested: want,
+          status: "WAITLISTED",
+          version: (reg?.version ?? 0) + 1,
+          updatedAt: now,
+        };
+        tx.set(ref(C.registrations, regId), data);
+        tx.update(ref(C.invitations, inv.id), { regStatus: "WAITLISTED", registrationId: regId, updatedAt: now });
+        return { status: "WAITLISTED", accessToken: data.accessToken, already: false };
+      }
+      return { status: "FULL" };
+    }
+
+    const data: Omit<Registration, "id"> = {
+      ...(reg ? withoutId(reg) : newRegistration({ ...base, status: "CONFIRMED" })),
+      ...base,
       withCompanion: want === 2,
       seats: want,
       seatsRequested: want,
@@ -218,142 +250,151 @@ export async function confirmInvitation(params: {
       cancelledAt: null,
       offeredAt: null,
       offerExpiresAt: null,
+      version: (reg?.version ?? 0) + 1,
+      updatedAt: now,
     };
-    const confirmed = reg
-      ? await guardedUpdate(tx, reg, data)
-      : await tx.registration.create({
-          data: { ...data, eventId: event.id, invitationId: inv.id, source: "INVITATION", accessToken: randomToken() },
-        });
-    await finalizeConfirmed(tx, event, confirmed, settings);
-    return { status: "CONFIRMED", accessToken: confirmed.accessToken, already: false };
+    writeConfirmed(tx, { event, regId, reg: data, prevSeats: 0, tickets, invitation: inv, settings });
+    return { status: "CONFIRMED", accessToken: data.accessToken, already: false };
   });
   await kickOutbox();
   return outcome;
 }
 
-/** تحديث مشروط بالحالة السابقة — يمنع تعارض تعديلين متزامنين على نفس التسجيل */
-async function guardedUpdate(tx: Tx, reg: Registration, data: Partial<Registration>) {
-  const res = await tx.registration.updateMany({ where: { id: reg.id, status: reg.status, updatedAt: reg.updatedAt }, data });
-  if (res.count !== 1) throw new AppError("تغيّرت حالة التسجيل للتو. حدّث الصفحة وحاول مرة أخرى.", "CONFLICT", 409);
-  return tx.registration.findUniqueOrThrow({ where: { id: reg.id } });
-}
-
 export async function declineInvitation(token: string): Promise<{ accessToken: string }> {
-  const result = await runRsvp(async (tx) => {
-    const inv = await tx.invitation.findUnique({ where: { token }, include: { event: true, registration: true } });
-    if (!inv || inv.event.mode !== "PRIVATE") throw new NotFoundError("الدعوة غير موجودة");
-    const closed = rsvpClosedReason(inv.event);
+  const found = await findInvitationByToken(token);
+  if (!found) throw new NotFoundError("الدعوة غير موجودة");
+  return runTx(async (tx) => {
+    const inv = await txGet<Invitation>(tx, ref(C.invitations, found.id));
+    if (!inv) throw new NotFoundError("الدعوة غير موجودة");
+    const event = await txGet<Event>(tx, ref(C.events, inv.eventId));
+    if (!event || event.mode !== "PRIVATE") throw new NotFoundError("الدعوة غير موجودة");
+    const regId = `inv_${inv.id}`;
+    const reg = await txGet<Registration>(tx, ref(C.registrations, regId));
+    const tickets = await readTickets(tx, regId);
+    const closed = rsvpClosedReason(event);
     if (closed && closed !== "NOT_ACTIVE") throw new AppError("انتهت فترة الرد على هذه الدعوة");
-    const reg = inv.registration;
     if (!reg) {
-      const created = await tx.registration.create({
-        data: {
-          eventId: inv.eventId,
-          invitationId: inv.id,
-          source: "INVITATION",
-          name: inv.name,
-          contactMethod: inv.phone ? "WHATSAPP" : "EMAIL",
-          phone: inv.phone,
-          email: inv.email,
-          status: "DECLINED",
-          seats: 0,
-          cancelledAt: new Date(),
-          accessToken: randomToken(),
-        },
+      const data = newRegistration({
+        eventId: inv.eventId,
+        invitationId: inv.id,
+        source: "INVITATION",
+        name: inv.name,
+        contactMethod: inv.phone ? "WHATSAPP" : "EMAIL",
+        phone: inv.phone,
+        email: inv.email,
+        status: "DECLINED",
+        cancelledAt: new Date(),
       });
-      return { accessToken: created.accessToken };
+      tx.set(ref(C.registrations, regId), data);
+      tx.update(ref(C.invitations, inv.id), { regStatus: "DECLINED", registrationId: regId, updatedAt: new Date() });
+      return { accessToken: data.accessToken };
     }
-    await cancelInTx(tx, reg, "DECLINED");
+    writeCancel(tx, { reg, event, tickets, invitation: inv, finalStatus: "DECLINED" });
     return { accessToken: reg.accessToken };
   });
-  return result;
 }
 
 // ───────── الرابط العام ─────────
 
-export async function getPublicEvent(slug: string) {
-  const event = await prisma.event.findUnique({ where: { publicSlug: slug }, include: { template: true } });
-  if (!event || event.mode !== "PUBLIC") throw new NotFoundError("الفعالية غير موجودة");
-  return event;
+async function findEventBySlug(slug: string) {
+  if (!slug) return null;
+  return getFirst<Event>(col(C.events).where("publicSlug", "==", slug));
 }
 
-export async function registerPublic(params: {
-  slug: string;
-  contact: ContactInput;
-  idempotencyKey?: string;
-}): Promise<RsvpOutcome> {
+export async function getPublicEvent(slug: string) {
+  const event = await findEventBySlug(slug);
+  if (!event || event.mode !== "PUBLIC") throw new NotFoundError("الفعالية غير موجودة");
+  return { ...event, template: await getDoc<Template>(C.templates, event.templateId) };
+}
+
+const dedupeUniqueKey = (eventId: string, key: string) => `reg-dedupe:${eventId}:${key}`;
+const idemUniqueKey = (eventId: string, key: string) => `reg-idem:${eventId}:${key}`;
+
+export async function registerPublic(params: { slug: string; contact: ContactInput; idempotencyKey?: string }): Promise<RsvpOutcome> {
   const contact = parseContact(params.contact);
   const settings = await getSettings();
   const idem = params.idempotencyKey && /^[A-Za-z0-9_-]{8,64}$/.test(params.idempotencyKey) ? params.idempotencyKey : null;
+  const found = await findEventBySlug(params.slug);
+  if (!found || found.mode !== "PUBLIC") throw new NotFoundError("الفعالية غير موجودة");
   let resendFor: string | null = null;
 
-  const outcome = await runRsvp(async (tx): Promise<RsvpOutcome> => {
+  const outcome = await runTx(async (tx): Promise<RsvpOutcome> => {
     resendFor = null;
-    const event = await tx.event.findUnique({ where: { publicSlug: params.slug } });
+    // ── القراءات ──
+    const event = await txGet<Event>(tx, ref(C.events, found.id));
     if (!event || event.mode !== "PUBLIC") throw new NotFoundError("الفعالية غير موجودة");
+    const dedupeKey = dedupeKeyFor(contact);
+    const idemSnap = idem ? await tx.get(uniqueRef(idemUniqueKey(event.id, idem))) : null;
+    const dedupeSnap = await tx.get(uniqueRef(dedupeUniqueKey(event.id, dedupeKey)));
+    const sameId = idemSnap?.exists ? (idemSnap.data()!.ref as string) : null;
+    const existingId = dedupeSnap.exists ? (dedupeSnap.data()!.ref as string) : null;
+    const same = sameId ? await txGet<Registration>(tx, ref(C.registrations, sameId)) : null;
+    const existing = existingId ? await txGet<Registration>(tx, ref(C.registrations, existingId)) : null;
+    const tickets = existing ? await readTickets(tx, existing.id) : { primary: null, companion: null };
+
     const closed = rsvpClosedReason(event);
     if (closed) return { status: "CLOSED", reason: closed };
 
     // نفس النموذج أُرسل مرة أخرى (ضغط متكرر/إعادة تحميل) → نفس النتيجة
-    if (idem) {
-      const same = await tx.registration.findUnique({ where: { eventId_idempotencyKey: { eventId: event.id, idempotencyKey: idem } } });
-      if (same) {
-        if (same.status === "CONFIRMED") return { status: "CONFIRMED", accessToken: same.accessToken, already: true };
-        if (same.status === "WAITLISTED" || same.status === "OFFERED")
-          return { status: "WAITLISTED", accessToken: same.accessToken, already: true };
-      }
+    if (same) {
+      if (same.status === "CONFIRMED") return { status: "CONFIRMED", accessToken: same.accessToken, already: true };
+      if (same.status === "WAITLISTED" || same.status === "OFFERED") return { status: "WAITLISTED", accessToken: same.accessToken, already: true };
     }
-
-    const dedupeKey = dedupeKeyFor(contact);
-    const existing = await tx.registration.findUnique({ where: { eventId_dedupeKey: { eventId: event.id, dedupeKey } } });
     if (existing && ["CONFIRMED", "WAITLISTED", "OFFERED"].includes(existing.status)) {
       // لا نعرض التذكرة لمن كتب وسيلة تواصل مسجلة؛ نعيد إرسالها لصاحبها فقط
       if (existing.status === "CONFIRMED") resendFor = existing.id;
       return { status: "ALREADY_REGISTERED", resent: existing.status === "CONFIRMED", waitlisted: existing.status !== "CONFIRMED" };
     }
 
-    const ok = await reserveSeats(tx, event.id, 1);
+    // ── القرار ثم الكتابة ──
     const now = new Date();
-    if (!ok) {
-      if (event.fullPolicy !== "WAITLIST") return { status: "FULL" };
-      const data = {
-        name: contact.name,
-        contactMethod: contact.contactMethod,
-        phone: contact.phone,
-        email: contact.email,
-        seats: 0,
-        seatsRequested: 1,
-        status: "WAITLISTED",
-        idempotencyKey: idem,
-        cancelledAt: null,
-      };
-      const w = existing
-        ? await guardedUpdate(tx, existing, data)
-        : await tx.registration.create({
-            data: { ...data, eventId: event.id, source: "PUBLIC", dedupeKey, accessToken: randomToken() },
-          });
-      return { status: "WAITLISTED", accessToken: w.accessToken, already: false };
-    }
-
-    const data = {
+    const regId = existing?.id ?? newId();
+    const base = {
+      eventId: event.id,
+      source: "PUBLIC",
       name: contact.name,
       contactMethod: contact.contactMethod,
       phone: contact.phone,
       email: contact.email,
+      dedupeKey,
+      idempotencyKey: idem,
+    };
+    const writeKeys = () => {
+      if (!existing) tx.set(uniqueRef(dedupeUniqueKey(event.id, dedupeKey)), { ref: regId });
+      if (idem) tx.set(uniqueRef(idemUniqueKey(event.id, idem)), { ref: regId });
+    };
+
+    if (!canReserve(event, 1)) {
+      if (event.fullPolicy !== "WAITLIST") return { status: "FULL" };
+      const data = {
+        ...(existing ? withoutId(existing) : newRegistration({ ...base, status: "WAITLISTED" })),
+        ...base,
+        seats: 0,
+        seatsRequested: 1,
+        status: "WAITLISTED",
+        cancelledAt: null,
+        version: (existing?.version ?? 0) + 1,
+        updatedAt: now,
+      };
+      tx.set(ref(C.registrations, regId), data);
+      writeKeys();
+      return { status: "WAITLISTED", accessToken: data.accessToken, already: false };
+    }
+
+    const data: Omit<Registration, "id"> = {
+      ...(existing ? withoutId(existing) : newRegistration({ ...base, status: "CONFIRMED" })),
+      ...base,
       seats: 1,
       seatsRequested: 1,
       status: "CONFIRMED",
       confirmedAt: now,
       cancelledAt: null,
-      idempotencyKey: idem,
+      version: (existing?.version ?? 0) + 1,
+      updatedAt: now,
     };
-    const reg = existing
-      ? await guardedUpdate(tx, existing, data)
-      : await tx.registration.create({
-          data: { ...data, eventId: event.id, source: "PUBLIC", dedupeKey, accessToken: randomToken() },
-        });
-    await finalizeConfirmed(tx, event, reg, settings);
-    return { status: "CONFIRMED", accessToken: reg.accessToken, already: false };
+    writeConfirmed(tx, { event, regId, reg: data, prevSeats: 0, tickets, invitation: null, settings });
+    writeKeys();
+    return { status: "CONFIRMED", accessToken: data.accessToken, already: false };
   });
 
   if (outcome.status === "ALREADY_REGISTERED" && resendFor) {
@@ -368,22 +409,22 @@ export async function registerPublic(params: {
 /** إعادة إرسال التذكرة لوسيلة التواصل المسجلة (بحد أدنى للمدة بين كل إرسال) */
 export async function resendTicket(registrationId: string, settings?: OperatingSettings): Promise<boolean> {
   const s = settings ?? (await getSettings());
-  return withTx(async (tx) => {
-    const reg = await tx.registration.findUnique({ where: { id: registrationId }, include: { event: true } });
+  return runTx(async (tx) => {
+    const reg = await txGet<Registration>(tx, ref(C.registrations, registrationId));
     if (!reg || reg.status !== "CONFIRMED") return false;
+    const event = await txGet<Event>(tx, ref(C.events, reg.eventId));
+    const tickets = await readTickets(tx, reg.id);
+    if (!event) return false;
     const cooldown = s.ticketResendCooldownMinutes * 60 * 1000;
-    const since = new Date(Date.now() - cooldown);
-    const guard = await tx.registration.updateMany({
-      where: { id: reg.id, OR: [{ lastTicketResendAt: null }, { lastTicketResendAt: { lt: since } }] },
-      data: { lastTicketResendAt: new Date() },
-    });
-    if (guard.count === 0) return false;
-    const tickets = await tx.ticket.findMany({ where: { registrationId: reg.id, status: "ACTIVE" } });
-    const msg = composeTicketResend(reg.event, reg, tickets);
+    if (reg.lastTicketResendAt && Date.now() - reg.lastTicketResendAt.getTime() < cooldown) return false;
     const recipient = reg.contactMethod === "WHATSAPP" ? reg.phone : reg.email;
     if (!recipient) return false;
-    await enqueuePackageMessage(tx, {
-      ownerId: reg.event.ownerId,
+    const now = new Date();
+    tx.update(ref(C.registrations, reg.id), { lastTicketResendAt: now, updatedAt: now });
+    const active = [tickets.primary, tickets.companion].filter((t): t is Ticket => !!t && t.status === "ACTIVE");
+    const msg = composeTicketResend(event, reg, active);
+    writePackageMessage(tx, {
+      ownerId: event.ownerId,
       eventId: reg.eventId,
       registrationId: reg.id,
       kind: "TICKET_RESEND",
@@ -391,7 +432,7 @@ export async function resendTicket(registrationId: string, settings?: OperatingS
       recipient,
       subject: msg.subject,
       body: msg.body,
-      idempotencyKey: `resend:${reg.id}:${Date.now()}`,
+      idempotencyKey: `resend:${reg.id}:${now.getTime()}`,
       settings: s,
     });
     return true;
@@ -400,115 +441,165 @@ export async function resendTicket(registrationId: string, settings?: OperatingS
 
 // ───────── صفحة الضيف: الاعتذار وقائمة الانتظار ─────────
 
+async function findRegistrationByAccessToken(accessToken: string) {
+  if (!accessToken) return null;
+  return getFirst<Registration>(col(C.registrations).where("accessToken", "==", accessToken));
+}
+
 export async function getRegistrationByAccessToken(accessToken: string) {
-  const reg = await prisma.registration.findUnique({
-    where: { accessToken },
-    include: {
-      event: { include: { template: true } },
-      invitation: true,
-      tickets: { where: { status: "ACTIVE" }, orderBy: { kind: "desc" } },
-    },
-  });
+  let reg = await findRegistrationByAccessToken(accessToken);
   if (!reg) throw new NotFoundError("الرابط غير صحيح");
   // انتهاء فرصة الانتظار عند فتح الصفحة
   if (reg.status === "OFFERED" && reg.offerExpiresAt && reg.offerExpiresAt < new Date()) {
-    await prisma.registration.updateMany({ where: { id: reg.id, status: "OFFERED" }, data: { status: "WAITLISTED" } });
-    reg.status = "WAITLISTED";
+    await expireOne(reg.id);
+    reg = (await getDoc<Registration>(C.registrations, reg.id))!;
   }
-  return reg;
+  const event = (await getDoc<Event>(C.events, reg.eventId))!;
+  const template = await getDoc<Template>(C.templates, event.templateId);
+  const invitation = await getDoc<Invitation>(C.invitations, reg.invitationId);
+  const tickets = (await getDocs<Ticket>(col(C.tickets).where("registrationId", "==", reg.id)))
+    .filter((t) => t.status === "ACTIVE")
+    .sort((a, b) => (a.kind === "PRIMARY" ? -1 : b.kind === "PRIMARY" ? 1 : 0));
+  return { ...reg, event: { ...event, template }, invitation, tickets };
 }
 
-async function cancelInTx(tx: Tx, reg: Registration, finalStatus: "CANCELLED" | "DECLINED") {
+/** كتابة الإلغاء/الاعتذار (بعد قراءة التسجيل والتذاكر والفعالية) */
+function writeCancel(
+  tx: Transaction,
+  ctx: {
+    reg: Registration;
+    event: Event;
+    tickets: { primary: Ticket | null; companion: Ticket | null };
+    invitation: Invitation | null;
+    finalStatus: "CANCELLED" | "DECLINED";
+  },
+) {
+  const { reg, event, tickets } = ctx;
   if (reg.status === "CANCELLED" || reg.status === "DECLINED") return;
-  if (reg.status === "CONFIRMED") {
-    const attended = await tx.ticket.count({ where: { registrationId: reg.id, checkedInAt: { not: null } } });
-    if (attended > 0) throw new AppError("لا يمكن الاعتذار بعد تسجيل الحضور");
+  if (reg.status === "CONFIRMED" && (tickets.primary?.checkedIn || tickets.companion?.checkedIn)) {
+    throw new AppError("لا يمكن الاعتذار بعد تسجيل الحضور");
   }
-  const res = await tx.registration.updateMany({
-    where: { id: reg.id, status: reg.status },
-    data: { status: finalStatus, seats: 0, cancelledAt: new Date(), offeredAt: null, offerExpiresAt: null },
+  const now = new Date();
+  tx.update(ref(C.registrations, reg.id), {
+    status: ctx.finalStatus,
+    seats: 0,
+    cancelledAt: now,
+    offeredAt: null,
+    offerExpiresAt: null,
+    version: reg.version + 1,
+    updatedAt: now,
   });
-  if (res.count !== 1) return; // أُلغي بالتزامن
   if (reg.status === "CONFIRMED") {
-    await releaseSeats(tx, reg.eventId, reg.seats);
-    await cancelTickets(tx, reg.id);
+    tx.update(ref(C.events, event.id), { reservedSeats: Math.max(0, event.reservedSeats - reg.seats), updatedAt: now });
+    cancelTicketsWrite(tx, tickets);
   }
+  if (reg.invitationId) tx.update(ref(C.invitations, reg.invitationId), { regStatus: ctx.finalStatus, updatedAt: now });
+}
+
+async function cancelRegistration(regId: string, opts: { ownerId?: string }) {
+  await runTx(async (tx) => {
+    const reg = await txGet<Registration>(tx, ref(C.registrations, regId));
+    if (!reg) throw new NotFoundError("التسجيل غير موجود");
+    const event = await txGet<Event>(tx, ref(C.events, reg.eventId));
+    if (!event || (opts.ownerId && event.ownerId !== opts.ownerId)) throw new NotFoundError("التسجيل غير موجود");
+    const tickets = await readTickets(tx, reg.id);
+    writeCancel(tx, { reg, event, tickets, invitation: null, finalStatus: reg.source === "INVITATION" ? "DECLINED" : "CANCELLED" });
+    if (opts.ownerId) auditTx(tx, { actorId: opts.ownerId, action: "registration.cancel", entityType: "Registration", entityId: reg.id });
+  });
 }
 
 export async function cancelByGuest(accessToken: string) {
-  await withTx(async (tx) => {
-    const reg = await tx.registration.findUnique({ where: { accessToken } });
-    if (!reg) throw new NotFoundError("الرابط غير صحيح");
-    await cancelInTx(tx, reg, reg.source === "INVITATION" ? "DECLINED" : "CANCELLED");
-  });
+  const reg = await findRegistrationByAccessToken(accessToken);
+  if (!reg) throw new NotFoundError("الرابط غير صحيح");
+  await cancelRegistration(reg.id, {});
 }
 
 export async function cancelByOrganizer(ownerId: string, registrationId: string) {
-  await withTx(async (tx) => {
-    const reg = await tx.registration.findFirst({ where: { id: registrationId, event: { ownerId } } });
-    if (!reg) throw new NotFoundError("التسجيل غير موجود");
-    await cancelInTx(tx, reg, reg.source === "INVITATION" ? "DECLINED" : "CANCELLED");
-    await audit(tx, { actorId: ownerId, action: "registration.cancel", entityType: "Registration", entityId: reg.id });
-  });
+  await cancelRegistration(registrationId, { ownerId });
 }
 
-async function claimOfferInTx(
-  tx: Tx,
-  event: Event,
-  reg: Registration,
-  opts: { withCompanion: boolean; contact?: ReturnType<typeof parseContact>; settings: OperatingSettings },
-): Promise<RsvpOutcome> {
-  if (reg.offerExpiresAt && reg.offerExpiresAt < new Date()) {
-    await tx.registration.updateMany({ where: { id: reg.id, status: "OFFERED" }, data: { status: "WAITLISTED" } });
+function claimOfferInTx(
+  tx: Transaction,
+  ctx: {
+    event: Event;
+    reg: Registration;
+    invitation: Invitation | null;
+    tickets: { primary: Ticket | null; companion: Ticket | null };
+    withCompanion: boolean;
+    contact?: Contact;
+    settings: OperatingSettings;
+  },
+): RsvpOutcome {
+  const { event, reg } = ctx;
+  const now = new Date();
+  if (reg.offerExpiresAt && reg.offerExpiresAt < now) {
+    tx.update(ref(C.registrations, reg.id), { status: "WAITLISTED", version: reg.version + 1, updatedAt: now });
+    if (reg.invitationId) tx.update(ref(C.invitations, reg.invitationId), { regStatus: "WAITLISTED", updatedAt: now });
     return { status: "OFFER_EXPIRED", accessToken: reg.accessToken };
   }
-  let allowCompanion = reg.seatsRequested >= 2;
-  if (reg.invitationId) {
-    const inv = await tx.invitation.findUnique({ where: { id: reg.invitationId } });
-    allowCompanion = !!inv?.allowCompanion;
-  }
-  const want = opts.withCompanion && allowCompanion ? 2 : 1;
-  const ok = await reserveSeats(tx, event.id, want);
-  if (!ok) {
-    const fresh = await tx.event.findUniqueOrThrow({ where: { id: event.id } });
-    if (want === 2 && availableSeats(fresh) === 1) return { status: "ONLY_ONE_LEFT" };
-    await tx.registration.updateMany({ where: { id: reg.id, status: "OFFERED" }, data: { status: "WAITLISTED" } });
+  const allowCompanion = ctx.invitation ? ctx.invitation.allowCompanion : reg.seatsRequested >= 2;
+  const want = ctx.withCompanion && allowCompanion ? 2 : 1;
+  if (!canReserve(event, want)) {
+    if (want === 2 && availableSeats(event) === 1) return { status: "ONLY_ONE_LEFT" };
+    tx.update(ref(C.registrations, reg.id), { status: "WAITLISTED", version: reg.version + 1, updatedAt: now });
+    if (reg.invitationId) tx.update(ref(C.invitations, reg.invitationId), { regStatus: "WAITLISTED", updatedAt: now });
     return { status: "OFFER_UNAVAILABLE", accessToken: reg.accessToken };
   }
-  const data: Partial<Registration> = {
+  const data: Omit<Registration, "id"> = {
+    ...withoutId(reg),
+    ...(ctx.contact ?? {}),
     status: "CONFIRMED",
     seats: want,
     withCompanion: want === 2,
-    confirmedAt: new Date(),
+    confirmedAt: now,
     offerExpiresAt: null,
+    version: reg.version + 1,
+    updatedAt: now,
   };
-  if (opts.contact) Object.assign(data, opts.contact);
-  const confirmed = await guardedUpdate(tx, reg, data);
-  await finalizeConfirmed(tx, event, confirmed, opts.settings);
-  return { status: "CONFIRMED", accessToken: confirmed.accessToken, already: false };
+  writeConfirmed(tx, { event, regId: reg.id, reg: data, prevSeats: 0, tickets: ctx.tickets, invitation: ctx.invitation, settings: ctx.settings });
+  return { status: "CONFIRMED", accessToken: reg.accessToken, already: false };
 }
 
 /** الضيف يؤكد فرصة قائمة الانتظار من صفحته */
 export async function claimOffer(accessToken: string, withCompanion: boolean): Promise<RsvpOutcome> {
   const settings = await getSettings();
-  const outcome = await runRsvp(async (tx): Promise<RsvpOutcome> => {
-    const reg = await tx.registration.findUnique({ where: { accessToken }, include: { event: true } });
+  const found = await findRegistrationByAccessToken(accessToken);
+  if (!found) throw new NotFoundError("الرابط غير صحيح");
+  const outcome = await runTx(async (tx): Promise<RsvpOutcome> => {
+    const reg = await txGet<Registration>(tx, ref(C.registrations, found.id));
     if (!reg) throw new NotFoundError("الرابط غير صحيح");
-    const closed = rsvpClosedReason(reg.event);
+    const event = (await txGet<Event>(tx, ref(C.events, reg.eventId)))!;
+    const invitation = reg.invitationId ? await txGet<Invitation>(tx, ref(C.invitations, reg.invitationId)) : null;
+    const tickets = await readTickets(tx, reg.id);
+    const closed = rsvpClosedReason(event);
     if (closed) return { status: "CLOSED", reason: closed };
     if (reg.status === "CONFIRMED") return { status: "CONFIRMED", accessToken, already: true };
     if (reg.status !== "OFFERED") throw new AppError("لا توجد فرصة تأكيد مفتوحة لهذا التسجيل");
-    return claimOfferInTx(tx, reg.event, reg, { withCompanion, settings });
+    return claimOfferInTx(tx, { event, reg, invitation, tickets, withCompanion, settings });
   });
   await kickOutbox();
   return outcome;
 }
 
-/** إعادة الفرص المنتهية إلى قائمة الانتظار (يُستدعى من العامل المجدول) */
-export async function expireOffers() {
-  const res = await prisma.registration.updateMany({
-    where: { status: "OFFERED", offerExpiresAt: { lt: new Date() } },
-    data: { status: "WAITLISTED" },
+async function expireOne(regId: string) {
+  await runTx(async (tx) => {
+    const reg = await txGet<Registration>(tx, ref(C.registrations, regId));
+    if (!reg || reg.status !== "OFFERED" || !reg.offerExpiresAt || reg.offerExpiresAt >= new Date()) return;
+    tx.update(ref(C.registrations, reg.id), { status: "WAITLISTED", version: reg.version + 1, updatedAt: new Date() });
+    if (reg.invitationId) tx.update(ref(C.invitations, reg.invitationId), { regStatus: "WAITLISTED", updatedAt: new Date() });
   });
-  return res.count;
+}
+
+/** إعادة الفرص المنتهية إلى قائمة الانتظار (يستدعيه العامل) */
+export async function expireOffers() {
+  const offered = await getDocs<Registration>(col(C.registrations).where("status", "==", "OFFERED"));
+  const now = new Date();
+  let n = 0;
+  for (const r of offered) {
+    if (r.offerExpiresAt && r.offerExpiresAt < now) {
+      await expireOne(r.id);
+      n++;
+    }
+  }
+  return n;
 }
