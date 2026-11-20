@@ -1,0 +1,529 @@
+// نموذج بيانات منصة وفدة
+// ملاحظة: الحالات مخزّنة كنصوص (String) بدل enum حتى يبقى المخطط قابلًا للنقل بين SQLite وPostgreSQL.
+// القيم المسموحة لكل حالة معرّفة ومُتحقق منها في src/lib/constants.ts.
+// المبالغ المالية بأصغر وحدة للعملة (هللة) كأعداد صحيحة.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ───────────── الحسابات والصلاحيات ─────────────
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  name         String
+  phone        String?
+  passwordHash String?
+  /// USER (منظّم/عضو فريق) | ADMIN (أدمن المنصة)
+  role         String   @default("USER")
+  /// ACTIVE | SUSPENDED | INVITED
+  status       String   @default("ACTIVE")
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  sessions         Session[]
+  authTokens       AuthToken[]
+  events           Event[]          @relation("EventOwner")
+  wallet           Wallet?
+  staffAssignments EventStaff[]     @relation("StaffUser")
+  staffAdded       EventStaff[]     @relation("StaffAddedBy")
+  payments         Payment[]
+  designRequests   DesignRequest[]
+  supportTickets   SupportTicket[]
+  comments         Comment[]
+  customTemplates  Template[]       @relation("TemplateOwner")
+  checkIns         Ticket[]         @relation("TicketCheckedInBy")
+  checkInLogs      CheckInLog[]
+  auditLogs        AuditLog[]
+  scheduledJobs    ScheduledJob[]
+  messageBatches   MessageBatch[]
+  messages         Message[]
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  tokenHash String   @unique
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+}
+
+model AuthToken {
+  id        String    @id @default(cuid())
+  tokenHash String    @unique
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// SET_PASSWORD
+  purpose   String
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+}
+
+// ───────────── القوالب ─────────────
+
+model Template {
+  id          String   @id @default(cuid())
+  name        String
+  description String   @default("")
+  /// تصنيف الاستخدام: GENERAL | WEDDING | CORPORATE | ACADEMIC | WORKSHOP | CLUB
+  category    String   @default("GENERAL")
+  /// التخطيط البصري المبني في الكود: plum-frame | ivory-classic | lilac-soft | corporate-clean | workshop-bold
+  layout      String
+  /// ألوان القالب JSON: { primary, accent, background, text, muted }
+  palette     String
+  /// ACTIVE | HIDDEN
+  status      String   @default("ACTIVE")
+  /// PUBLIC (لكل المنظّمين) | PRIVATE (تصميم خاص لمنظّم واحد)
+  visibility  String   @default("PUBLIC")
+  ownerId     String?
+  owner       User?    @relation("TemplateOwner", fields: [ownerId], references: [id])
+  sortOrder   Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  events         Event[]
+  designRequests DesignRequest[] @relation("DeliveredTemplate")
+}
+
+// ───────────── الفعاليات ─────────────
+
+model Event {
+  id           String    @id @default(cuid())
+  ownerId      String
+  owner        User      @relation("EventOwner", fields: [ownerId], references: [id])
+  title        String
+  hostName     String    @default("")
+  description  String    @default("")
+  startsAt     DateTime
+  endsAt       DateTime?
+  timezone     String    @default("Asia/Riyadh")
+  venueName    String    @default("")
+  venueAddress String    @default("")
+  mapUrl       String?
+  /// PRIVATE (دعوات خاصة بالاسم) | PUBLIC (رابط عام)
+  mode         String
+  /// الحد الأقصى للحضور (أشخاص)
+  capacity     Int
+  /// سياسة اكتمال العدد: CLOSE | WAITLIST
+  fullPolicy   String    @default("CLOSE")
+  templateId   String?
+  template     Template? @relation(fields: [templateId], references: [id])
+  /// DRAFT | ACTIVE | ENDED | CANCELLED
+  status       String    @default("DRAFT")
+  /// الأماكن المدفوعة في الباقة (الاستحقاق المؤكد من الدفع)
+  paidPlaces   Int       @default(0)
+  /// المقاعد المحجوزة فعليًا من الضيوف المؤكدين
+  reservedSeats Int      @default(0)
+  /// معرّف الرابط العام (عشوائي)
+  publicSlug   String?   @unique
+  publishedAt  DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  invitations    Invitation[]
+  registrations  Registration[]
+  tickets        Ticket[]
+  staff          EventStaff[]
+  checkInLogs    CheckInLog[]
+  messages       Message[]
+  messageBatches MessageBatch[]
+  scheduledJobs  ScheduledJob[]
+  payments       Payment[]
+  designRequests DesignRequest[]
+  supportTickets SupportTicket[]
+
+  @@index([ownerId])
+}
+
+model Invitation {
+  id             String    @id @default(cuid())
+  eventId        String
+  event          Event     @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  name           String
+  /// E.164 مثل +9665xxxxxxxx
+  phone          String?
+  email          String?
+  /// قناة الإرسال: WHATSAPP | EMAIL | BOTH
+  channel        String
+  allowCompanion Boolean   @default(false)
+  /// معرّف رابط الدعوة (عشوائي صعب التخمين)
+  token          String    @unique
+  /// NOT_SENT | QUEUED | SENT | FAILED
+  deliveryStatus String    @default("NOT_SENT")
+  lastSentAt     DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  registration Registration?
+  messages     Message[]
+
+  @@unique([eventId, phone])
+  @@unique([eventId, email])
+  @@index([eventId])
+}
+
+model Registration {
+  id             String      @id @default(cuid())
+  eventId        String
+  event          Event       @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  invitationId   String?     @unique
+  invitation     Invitation? @relation(fields: [invitationId], references: [id], onDelete: Cascade)
+  /// INVITATION | PUBLIC
+  source         String
+  name           String
+  /// WHATSAPP | EMAIL
+  contactMethod  String
+  phone          String?
+  email          String?
+  /// مفتاح منع التكرار في الرابط العام (وسيلة التواصل الموحّدة). فارغ في الدعوات الخاصة.
+  dedupeKey      String?
+  /// مفتاح منع تكرار الإرسال من نفس النموذج
+  idempotencyKey String?
+  withCompanion  Boolean     @default(false)
+  /// المقاعد المحجوزة حاليًا (0 عند الانتظار أو الإلغاء)
+  seats          Int         @default(0)
+  /// المقاعد المطلوبة (1 أو 2)
+  seatsRequested Int         @default(1)
+  /// CONFIRMED | WAITLISTED | OFFERED | CANCELLED | DECLINED
+  status         String
+  /// معرّف صفحة الضيف (التذاكر/فرصة الانتظار)
+  accessToken    String      @unique
+  offeredAt      DateTime?
+  offerExpiresAt DateTime?
+  confirmedAt    DateTime?
+  cancelledAt    DateTime?
+  lastTicketResendAt DateTime?
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+
+  tickets  Ticket[]
+  messages Message[]
+
+  @@unique([eventId, dedupeKey])
+  @@unique([eventId, idempotencyKey])
+  @@index([eventId, status])
+}
+
+model Ticket {
+  id             String       @id @default(cuid())
+  eventId        String
+  event          Event        @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  registrationId String
+  registration   Registration @relation(fields: [registrationId], references: [id], onDelete: Cascade)
+  /// PRIMARY (المدعو/المسجّل) | COMPANION (المرافق)
+  kind           String
+  holderName     String
+  /// محتوى رمز QR: معرّف عشوائي لا يحمل بيانات شخصية
+  code           String       @unique
+  /// ACTIVE | CANCELLED
+  status         String       @default("ACTIVE")
+  checkedInAt    DateTime?
+  checkedInById  String?
+  checkedInBy    User?        @relation("TicketCheckedInBy", fields: [checkedInById], references: [id])
+  /// SCAN | MANUAL
+  checkInMethod  String?
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  checkInLogs CheckInLog[]
+
+  @@unique([registrationId, kind])
+  @@index([eventId])
+}
+
+model EventStaff {
+  id        String   @id @default(cuid())
+  eventId   String
+  event     Event    @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User     @relation("StaffUser", fields: [userId], references: [id], onDelete: Cascade)
+  addedById String
+  addedBy   User     @relation("StaffAddedBy", fields: [addedById], references: [id])
+  createdAt DateTime @default(now())
+
+  @@unique([eventId, userId])
+}
+
+model CheckInLog {
+  id       String   @id @default(cuid())
+  eventId  String
+  event    Event    @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  ticketId String?
+  ticket   Ticket?  @relation(fields: [ticketId], references: [id], onDelete: SetNull)
+  staffId  String
+  staff    User     @relation(fields: [staffId], references: [id])
+  /// SCAN | MANUAL
+  method   String
+  /// SUCCESS | ALREADY | INVALID | WRONG_EVENT | CANCELLED
+  result   String
+  createdAt DateTime @default(now())
+
+  @@index([eventId])
+}
+
+// ───────────── الرسائل والرصيد ─────────────
+
+model Wallet {
+  id           String              @id @default(cuid())
+  userId       String              @unique
+  user         User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  balance      Int                 @default(0)
+  createdAt    DateTime            @default(now())
+  updatedAt    DateTime            @updatedAt
+  transactions WalletTransaction[]
+}
+
+model WalletTransaction {
+  id             String   @id @default(cuid())
+  walletId       String
+  wallet         Wallet   @relation(fields: [walletId], references: [id], onDelete: Cascade)
+  /// TOPUP | DEBIT | REFUND | ADJUSTMENT
+  type           String
+  /// موجب للإضافة وسالب للخصم
+  amount         Int
+  balanceAfter   Int
+  description    String
+  paymentId      String?
+  batchId        String?
+  messageId      String?
+  idempotencyKey String   @unique
+  createdAt      DateTime @default(now())
+
+  @@index([walletId])
+}
+
+model MessageBatch {
+  id             String   @id @default(cuid())
+  ownerId        String
+  owner          User     @relation(fields: [ownerId], references: [id])
+  eventId        String
+  event          Event    @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  /// INVITATION | REMINDER | WAITLIST_OFFER
+  kind           String
+  idempotencyKey String   @unique
+  recipientCount Int
+  messageCount   Int
+  totalCost      Int
+  /// MANUAL | SCHEDULED
+  trigger        String   @default("MANUAL")
+  scheduledJobId String?
+  createdAt      DateTime @default(now())
+
+  messages Message[]
+}
+
+model Message {
+  id             String        @id @default(cuid())
+  ownerId        String
+  owner          User          @relation(fields: [ownerId], references: [id])
+  eventId        String?
+  event          Event?        @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  batchId        String?
+  batch          MessageBatch? @relation(fields: [batchId], references: [id], onDelete: SetNull)
+  invitationId   String?
+  invitation     Invitation?   @relation(fields: [invitationId], references: [id], onDelete: SetNull)
+  registrationId String?
+  registration   Registration? @relation(fields: [registrationId], references: [id], onDelete: SetNull)
+  /// INVITATION | REMINDER | CONFIRMATION | WAITLIST_OFFER | STAFF_INVITE | TICKET_RESEND
+  kind           String
+  /// WHATSAPP | EMAIL
+  channel        String
+  recipient      String
+  subject        String?
+  body           String
+  /// QUEUED | SENDING | SENT | FAILED
+  status         String        @default("QUEUED")
+  attempts       Int           @default(0)
+  nextAttemptAt  DateTime      @default(now())
+  lastError      String?
+  provider       String?
+  providerMessageId String?
+  /// جهة التحميل: WALLET (رصيد الرسائل) | PACKAGE (ضمن الباقة) | NONE
+  billing        String
+  /// المبلغ المخصوم من الرصيد (WALLET)
+  cost           Int           @default(0)
+  /// تكلفة تشغيل تقديرية تُحمّل على الباقة (PACKAGE)
+  operatingCost  Int           @default(0)
+  refunded       Boolean       @default(false)
+  idempotencyKey String        @unique
+  sentAt         DateTime?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  @@index([status, nextAttemptAt])
+  @@index([eventId])
+  @@index([invitationId])
+}
+
+model ScheduledJob {
+  id            String    @id @default(cuid())
+  /// REMINDER
+  type          String
+  ownerId       String
+  owner         User      @relation(fields: [ownerId], references: [id])
+  eventId       String
+  event         Event     @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  runAt         DateTime
+  /// PENDING | RUNNING | DONE | FAILED | CANCELLED
+  status        String    @default("PENDING")
+  /// JSON
+  payload       String    @default("{}")
+  /// JSON
+  result        String?
+  estimatedCost Int       @default(0)
+  startedAt     DateTime?
+  finishedAt    DateTime?
+  createdAt     DateTime  @default(now())
+
+  @@index([status, runAt])
+}
+
+// ───────────── الباقات والمدفوعات ─────────────
+
+model PricingPlan {
+  id        String   @id @default(cuid())
+  name      String
+  places    Int
+  price     Int
+  active    Boolean  @default(true)
+  sortOrder Int      @default(0)
+  /// قيمة تجريبية للاختبار وليست سعرًا معتمدًا
+  isDemo    Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Payment {
+  id              String         @id @default(cuid())
+  ownerId         String
+  owner           User           @relation(fields: [ownerId], references: [id])
+  eventId         String?
+  event           Event?         @relation(fields: [eventId], references: [id])
+  designRequestId String?
+  designRequest   DesignRequest? @relation(fields: [designRequestId], references: [id])
+  /// PACKAGE | EXTRA_PLACES | WALLET_TOPUP | DESIGN
+  purpose         String
+  amount          Int
+  currency        String         @default("SAR")
+  /// عدد الأماكن التي يضيفها الدفع (للباقة والأماكن الإضافية)
+  places          Int            @default(0)
+  description     String         @default("")
+  /// PENDING | PAID | FAILED | CANCELLED
+  status          String         @default("PENDING")
+  provider        String
+  providerRef     String?        @unique
+  paidAt          DateTime?
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  events PaymentEvent[]
+
+  @@index([ownerId])
+}
+
+model PaymentEvent {
+  id              String   @id @default(cuid())
+  provider        String
+  providerEventId String
+  paymentId       String?
+  payment         Payment? @relation(fields: [paymentId], references: [id])
+  type            String
+  payload         String
+  /// PROCESSED | IGNORED | REJECTED
+  outcome         String
+  receivedAt      DateTime @default(now())
+
+  @@unique([provider, providerEventId])
+}
+
+// ───────────── التصاميم الخاصة والدعم ─────────────
+
+model DesignRequest {
+  id                  String    @id @default(cuid())
+  ownerId             String
+  owner               User      @relation(fields: [ownerId], references: [id])
+  eventId             String?
+  event               Event?    @relation(fields: [eventId], references: [id], onDelete: SetNull)
+  title               String
+  details             String
+  referenceUrl        String?
+  /// SUBMITTED | QUOTED | ACCEPTED | PAID | IN_PROGRESS | DELIVERED | REJECTED | CANCELLED
+  status              String    @default("SUBMITTED")
+  quoteAmount         Int?
+  quoteNotes          String?
+  quoteValidUntil     DateTime?
+  quotedAt            DateTime?
+  acceptedAt          DateTime?
+  deliveredTemplateId String?
+  deliveredTemplate   Template? @relation("DeliveredTemplate", fields: [deliveredTemplateId], references: [id])
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  comments Comment[]
+  payments Payment[]
+}
+
+model SupportTicket {
+  id        String   @id @default(cuid())
+  ownerId   String
+  owner     User     @relation(fields: [ownerId], references: [id])
+  eventId   String?
+  event     Event?   @relation(fields: [eventId], references: [id], onDelete: SetNull)
+  /// COMPLAINT | QUESTION | BILLING | TECHNICAL
+  category  String
+  subject   String
+  body      String
+  /// OPEN | IN_PROGRESS | RESOLVED | CLOSED
+  status    String   @default("OPEN")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  comments Comment[]
+}
+
+model Comment {
+  id              String         @id @default(cuid())
+  authorId        String
+  author          User           @relation(fields: [authorId], references: [id])
+  designRequestId String?
+  designRequest   DesignRequest? @relation(fields: [designRequestId], references: [id], onDelete: Cascade)
+  supportTicketId String?
+  supportTicket   SupportTicket? @relation(fields: [supportTicketId], references: [id], onDelete: Cascade)
+  body            String
+  createdAt       DateTime       @default(now())
+}
+
+// ───────────── الإعدادات والتدقيق ─────────────
+
+model Setting {
+  key         String   @id
+  /// JSON
+  value       String
+  updatedById String?
+  updatedAt   DateTime @updatedAt
+}
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  actorId    String?
+  actor      User?    @relation(fields: [actorId], references: [id])
+  action     String
+  entityType String
+  entityId   String?
+  /// JSON
+  meta       String   @default("{}")
+  createdAt  DateTime @default(now())
+
+  @@index([entityType, entityId])
+  @@index([createdAt])
+}
