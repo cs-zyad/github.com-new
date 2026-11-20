@@ -27,8 +27,8 @@ npm run dev                 # http://localhost:3000
 
 ### التجربة من الجوال بدون كمبيوتر (GitHub Codespaces)
 
-1. افتح المستودع على github.com من متصفح الجوال (يفضّل «عرض نسخة سطح المكتب»)، واختر الفرع `claude/stoic-hamilton-xhb8pq`.
-2. **Code ← Codespaces ← Create codespace on claude/stoic-hamilton-xhb8pq**.
+1. افتح المستودع على github.com من متصفح الجوال (يفضّل «عرض نسخة سطح المكتب»).
+2. **Code ← Codespaces ← Create codespace on main**.
 3. انتظر حتى ينتهي التجهيز (أول مرة 3–5 دقائق: تثبيت، بيانات تجريبية، بناء). السكربت `scripts/codespace-start.sh` يشغّل كل شيء تلقائيًا.
 4. افتح تبويب **Ports** واضغط رابط المنفذ **3000 (وفدة)**. الرابط HTTPS فتعمل كاميرا التحضير على الجوال.
 5. ليفتح الضيوف الروابط من جوالاتهم بدون حساب GitHub: من تبويب Ports غيّر **Port Visibility** للمنفذ 3000 إلى **Public**.
