@@ -156,6 +156,8 @@ export async function confirmInvitation(params: {
   token: string;
   contact: ContactInput;
   withCompanion: boolean;
+  /** عند بقاء مقعد واحد وطلب مقعدين: الانضمام لقائمة الانتظار بدل التأكيد منفردًا (إن كانت السياسة تسمح) */
+  joinWaitlist?: boolean;
 }): Promise<RsvpOutcome> {
   const contact = parseContact(params.contact);
   const settings = await getSettings();
@@ -178,7 +180,9 @@ export async function confirmInvitation(params: {
     const ok = await reserveSeats(tx, event.id, want);
     if (!ok) {
       const fresh = await tx.event.findUniqueOrThrow({ where: { id: event.id } });
-      if (want === 2 && availableSeats(fresh) === 1) return { status: "ONLY_ONE_LEFT" };
+      if (want === 2 && availableSeats(fresh) === 1 && !(params.joinWaitlist && fresh.fullPolicy === "WAITLIST")) {
+        return { status: "ONLY_ONE_LEFT" };
+      }
       if (fresh.fullPolicy === "WAITLIST") {
         const data = {
           name: contact.name,
