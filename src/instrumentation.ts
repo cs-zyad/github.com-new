@@ -5,6 +5,8 @@
 export async function register() {
   if (process.env.NEXT_RUNTIME !== "nodejs") return;
   if ((process.env.RUN_WORKER ?? "true") !== "true") return;
+  // على Vercel (دوال مؤقتة) يعمل العامل عبر Vercel Cron على /api/cron
+  if (process.env.VERCEL) return;
   const g = globalThis as unknown as { __wafdaWorker?: NodeJS.Timeout };
   if (g.__wafdaWorker) return;
   const { workerTick } = await import("./services/worker");

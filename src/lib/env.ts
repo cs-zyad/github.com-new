@@ -2,7 +2,10 @@
 
 export const env = {
   get appUrl() {
-    return (process.env.APP_URL || "http://localhost:3000").replace(/\/$/, "");
+    // على Vercel: الرابط الدائم للمشروع إن لم يُحدَّد APP_URL
+    const vercel = process.env.VERCEL_PROJECT_PRODUCTION_URL || process.env.VERCEL_URL;
+    const url = process.env.APP_URL || (vercel ? `https://${vercel}` : "http://localhost:3000");
+    return url.replace(/\/$/, "");
   },
   get demoMode() {
     return (process.env.DEMO_MODE ?? "true") === "true";

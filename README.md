@@ -35,6 +35,18 @@ npm run dev                 # http://localhost:3000
 
 > الـ Codespace يتوقف تلقائيًا بعد فترة خمول؛ عند فتحه مرة أخرى يعيد السكربت تشغيل المنصة. البيانات محفوظة داخله.
 
+### النشر على Vercel (رابط دائم)
+
+1. ادخل [vercel.com](https://vercel.com) بحساب GitHub ← **Add New ← Project** ← اختر المستودع ← **Deploy** (أول بناء سيفشل برسالة تطلب قاعدة البيانات — طبيعي).
+2. من المشروع: **Storage ← Create Database ← Neon (Postgres)** ← اربطه بالمشروع (يضيف `DATABASE_URL` تلقائيًا).
+3. **Settings ← Environment Variables** وأضف:
+   - `DEMO_MODE` = `true` (للتجربة: صندوق رسائل ودفع تجريبيان + بيانات تجريبية)
+   - `PAYMENT_WEBHOOK_SECRET` = نص عشوائي طويل
+   - `CRON_SECRET` = نص عشوائي طويل
+4. **Deployments ← Redeploy**. البناء (`scripts/vercel-build.mjs`) يحوّل المخطط إلى PostgreSQL، يجهّز الجداول، ويعبّئ البيانات التجريبية مرة واحدة.
+
+> على خطة Vercel المجانية تعمل المهام المجدولة (التذكيرات المجدولة وإعادة محاولة الرسائل) مرة يوميًا عبر Vercel Cron. الإرسال الفوري يعمل مباشرة مع كل إجراء. لدقة بالدقيقة تحتاج خطة Pro أو خدمة cron خارجية تستدعي `/api/cron?key=CRON_SECRET`.
+
 ### حسابات التجربة
 
 كلمة المرور لجميعها: `Wafda@2026`

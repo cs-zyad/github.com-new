@@ -2,10 +2,26 @@ import { PrismaClient, Prisma } from "@prisma/client";
 
 const globalForPrisma = globalThis as unknown as { prisma?: PrismaClient; walEnabled?: boolean };
 
+/**
+ * اتصال عبر مجمّع اتصالات (مثل Neon pooler على Vercel) يحتاج pgbouncer=true مع Prisma
+ * لتعطيل العبارات المُعدّة التي لا يدعمها وضع المعاملات.
+ */
+function resolveUrl(): string | undefined {
+  const url = process.env.DATABASE_URL;
+  if (!url || !/^postgres/.test(url)) return undefined;
+  if (/-pooler\./.test(url) && !/pgbouncer=/.test(url)) {
+    return url + (url.includes("?") ? "&" : "?") + "pgbouncer=true";
+  }
+  return undefined;
+}
+
+const datasourceUrl = resolveUrl();
+
 export const prisma =
   globalForPrisma.prisma ??
   new PrismaClient({
     log: process.env.PRISMA_LOG === "1" ? ["query", "error", "warn"] : ["error"],
+    ...(datasourceUrl ? { datasourceUrl } : {}),
   });
 
 if (process.env.NODE_ENV !== "production") globalForPrisma.prisma = prisma;
