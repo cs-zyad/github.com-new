@@ -13,3 +13,4 @@ prisma/postgres/
 test-results/
 playwright-report/
 coverage/
+e2e/screenshots/

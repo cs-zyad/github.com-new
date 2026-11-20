@@ -26,9 +26,9 @@ export default async function TemplatePage({
   const sampleName = "سارة العتيبي";
   const inviteMsg =
     event.mode === "PRIVATE"
-      ? composeInvitation(event, { name: sampleName, token: "مثال-رابط-الدعوة", allowCompanion: false }, "INVITATION")
+      ? composeInvitation(event, { name: sampleName, token: "example-invite", allowCompanion: false }, "INVITATION")
       : null;
-  const confirmMsg = composeConfirmation(event, { name: sampleName, accessToken: "مثال" }, [{ kind: "PRIMARY", code: "W1مثال-رمز-التذكرة" }]);
+  const confirmMsg = composeConfirmation(event, { name: sampleName, accessToken: "example" }, [{ kind: "PRIMARY", code: "W1example-ticket" }]);
 
   return (
     <div className="stack">

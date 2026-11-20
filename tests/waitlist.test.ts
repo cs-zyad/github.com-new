@@ -96,4 +96,19 @@ describe("قائمة الانتظار", () => {
     expect(fresh.seats).toBe(1);
     expect(fresh.withCompanion).toBe(false);
   });
+
+  it("مقعد واحد متبقٍ: المدعو يختار الانتظار مع مرافقه بدل التأكيد منفردًا", async () => {
+    const owner = await makeUser();
+    const event = await makeEvent(owner.id, { capacity: 2, fullPolicy: "WAITLIST" });
+    const a = await makeInvitation(event.id);
+    const b = await makeInvitation(event.id, { allowCompanion: true });
+    await confirmInvitation({ token: a.token, contact: { name: "ضيف1", contactMethod: "WHATSAPP", phone: "0504000001" }, withCompanion: false });
+    const contact = { name: "ضيف2", contactMethod: "WHATSAPP" as const, phone: "0504000002" };
+    expect((await confirmInvitation({ token: b.token, contact, withCompanion: true })).status).toBe("ONLY_ONE_LEFT");
+    const w = await confirmInvitation({ token: b.token, contact, withCompanion: true, joinWaitlist: true });
+    expect(w.status).toBe("WAITLISTED");
+    const reg = await prisma.registration.findFirstOrThrow({ where: { invitationId: b.id } });
+    expect(reg.seatsRequested).toBe(2);
+    expect((await prisma.event.findUniqueOrThrow({ where: { id: event.id } })).reservedSeats).toBe(1);
+  });
 });
